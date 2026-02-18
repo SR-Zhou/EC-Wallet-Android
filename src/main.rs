@@ -1,8 +1,6 @@
-use dioxus::prelude::*;
-
 fn main()
 {
-    dioxus::launch(gui::app);
+    gui::launch();
 }
 
 mod blockchain;

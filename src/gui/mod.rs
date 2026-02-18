@@ -303,12 +303,12 @@ impl TokenType
 
 pub fn launch()
 {
-    dioxus::LaunchBuilder::mobile().launch(app);
+    dioxus::launch(app);
 }
 
 // ============ 主组件 ============
 
-pub fn app() -> Element
+fn app() -> Element
 {
     let page = use_signal(|| {
         let list = load_wallet_list();
