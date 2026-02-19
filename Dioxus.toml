@@ -1,6 +1,5 @@
 [application]
 name = "EC-Wallet"
-bundle_identifier = "com.ec.wallet"
 
 [bundle]
 identifier = "com.ec.wallet"
