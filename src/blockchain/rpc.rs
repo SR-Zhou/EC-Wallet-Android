@@ -40,6 +40,7 @@ struct JsonRpcError
     message: String,
 }
 
+#[allow(dead_code)]
 impl RpcClient
 {
     /// 创建新的 RPC 客户端
@@ -118,27 +119,6 @@ impl RpcClient
         json_response.result.ok_or_else(|| "Empty RPC response".to_string())
     }
 
-    /// 获取链 ID
-    /// 
-    /// # 返回
-    /// - 链 ID (u64)
-    pub async fn eth_chain_id(&self) -> Result<u64, String>
-    {
-        let result = self.call("eth_chainId", json!([])).await?;
-        let hex = result.as_str().ok_or("Invalid chainId response")?;
-        utils::hex_to_u64(hex)
-    }
-
-    /// 获取当前区块号
-    /// 
-    /// # 返回
-    /// - 区块号 (u64)
-    pub async fn eth_block_number(&self) -> Result<u64, String>
-    {
-        let result = self.call("eth_blockNumber", json!([])).await?;
-        let hex = result.as_str().ok_or("Invalid blockNumber response")?;
-        utils::hex_to_u64(hex)
-    }
 
     /// 获取账户余额
     /// 
@@ -258,107 +238,5 @@ impl RpcClient
         result.as_str()
             .map(|s| s.to_string())
             .ok_or("Invalid eth_call response".to_string())
-    }
-
-    /// 获取区块信息
-    /// 
-    /// # 参数
-    /// - `block`: 区块号的十六进制字符串
-    /// - `full_transactions`: 是否包含完整交易信息
-    /// 
-    /// # 返回
-    /// - 区块信息 JSON
-    pub async fn eth_get_block_by_number(&self, block: &str, full_transactions: bool) -> Result<Option<Value>, String>
-    {
-        let result = self.call("eth_getBlockByNumber", json!([block, full_transactions])).await?;
-        if result.is_null()
-        {
-            Ok(None)
-        }
-        else
-        {
-            Ok(Some(result))
-        }
-    }
-
-    /// 通过哈希获取区块信息
-    /// 
-    /// # 参数
-    /// - `block_hash`: 区块哈希
-    /// - `full_transactions`: 是否包含完整交易信息
-    /// 
-    /// # 返回
-    /// - 区块信息 JSON
-    pub async fn eth_get_block_by_hash(&self, block_hash: &str, full_transactions: bool) -> Result<Option<Value>, String>
-    {
-        let result = self.call("eth_getBlockByHash", json!([block_hash, full_transactions])).await?;
-        if result.is_null()
-        {
-            Ok(None)
-        }
-        else
-        {
-            Ok(Some(result))
-        }
-    }
-
-    /// 获取交易信息
-    /// 
-    /// # 参数
-    /// - `tx_hash`: 交易哈希
-    /// 
-    /// # 返回
-    /// - 交易信息 JSON
-    pub async fn eth_get_transaction_by_hash(&self, tx_hash: &str) -> Result<Option<Value>, String>
-    {
-        let result = self.call("eth_getTransactionByHash", json!([tx_hash])).await?;
-        if result.is_null()
-        {
-            Ok(None)
-        }
-        else
-        {
-            Ok(Some(result))
-        }
-    }
-
-    /// 获取事件日志
-    /// 
-    /// # 参数
-    /// - `filter`: 日志过滤器 JSON
-    /// 
-    /// # 返回
-    /// - 日志列表 JSON
-    pub async fn eth_get_logs(&self, filter: Value) -> Result<Value, String>
-    {
-        self.call("eth_getLogs", json!([filter])).await
-    }
-
-    /// 获取合约代码
-    /// 
-    /// # 参数
-    /// - `address`: 合约地址
-    /// - `block`: 区块标识
-    /// 
-    /// # 返回
-    /// - 合约字节码的十六进制字符串
-    pub async fn eth_get_code(&self, address: &str, block: &str) -> Result<String, String>
-    {
-        let result = self.call("eth_getCode", json!([address, block])).await?;
-        result.as_str()
-            .map(|s| s.to_string())
-            .ok_or("Invalid getCode response".to_string())
-    }    /// 获取最新区块的基础费用
-    /// 
-    /// # 返回
-    /// - 基础费用（十六进制字符串）
-    pub async fn get_base_fee(&self) -> Result<String, String>
-    {
-        let block = self.eth_get_block_by_number("latest", false).await?;
-        let block = block.ok_or("Failed to get latest block")?;
-        let base_fee_hex = block["baseFeePerGas"]
-            .as_str()
-            .ok_or("Block does not contain baseFeePerGas (pre-EIP-1559 chain?)")?;
-        Ok(base_fee_hex.to_string())
     }
 }

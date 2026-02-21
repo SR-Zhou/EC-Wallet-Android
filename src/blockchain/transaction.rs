@@ -154,16 +154,6 @@ impl TransactionBuilder
         self
     }
 
-    /// 设置转账金额（Wei）
-    /// 
-    /// # 参数
-    /// - `value`: 转账金额
-    pub fn value(mut self, value: U256) -> Self
-    {
-        self.value = value;
-        self
-    }
-
     /// 设置交易数据
     /// 
     /// # 参数
@@ -181,36 +171,6 @@ impl TransactionBuilder
     pub fn gas_limit(mut self, gas_limit: u64) -> Self
     {
         self.gas_limit = Some(gas_limit);
-        self
-    }
-
-    /// 设置 Gas 价格（Legacy 交易）
-    /// 
-    /// # 参数
-    /// - `gas_price`: Gas 价格（Wei）
-    pub fn gas_price(mut self, gas_price: U256) -> Self
-    {
-        self.gas_price = Some(gas_price);
-        self
-    }
-
-    /// 设置最大费用（EIP-1559）
-    /// 
-    /// # 参数
-    /// - `max_fee`: 最大费用（Wei）
-    pub fn max_fee_per_gas(mut self, max_fee: U256) -> Self
-    {
-        self.max_fee_per_gas = Some(max_fee);
-        self
-    }
-
-    /// 设置最大优先费用（EIP-1559）
-    /// 
-    /// # 参数
-    /// - `max_priority_fee`: 最大优先费用（Wei）
-    pub fn max_priority_fee_per_gas(mut self, max_priority_fee: U256) -> Self
-    {
-        self.max_priority_fee_per_gas = Some(max_priority_fee);
         self
     }
 
@@ -245,38 +205,6 @@ impl TransactionBuilder
         let mut bytes = [0u8; 32];
         bytes[16..32].copy_from_slice(&value.to_be_bytes());
         self.gas_price = Some(U256::from_be_slice(&bytes));
-        self
-    }
-
-    /// 设置最大费用（使用 u128 Wei，EIP-1559）
-    /// 
-    /// # 参数
-    /// - `value`: 最大费用（u128 Wei）
-    /// 
-    /// # 返回
-    /// - Self
-    pub fn max_fee_per_gas_u128(mut self, value: u128) -> Self
-    {
-        // 将 u128 转换为 U256
-        let mut bytes = [0u8; 32];
-        bytes[16..32].copy_from_slice(&value.to_be_bytes());
-        self.max_fee_per_gas = Some(U256::from_be_slice(&bytes));
-        self
-    }
-
-    /// 设置最大优先费用（使用 u128 Wei，EIP-1559）
-    /// 
-    /// # 参数
-    /// - `value`: 最大优先费用（u128 Wei）
-    /// 
-    /// # 返回
-    /// - Self
-    pub fn max_priority_fee_per_gas_u128(mut self, value: u128) -> Self
-    {
-        // 将 u128 转换为 U256
-        let mut bytes = [0u8; 32];
-        bytes[16..32].copy_from_slice(&value.to_be_bytes());
-        self.max_priority_fee_per_gas = Some(U256::from_be_slice(&bytes));
         self
     }
 
@@ -623,17 +551,6 @@ fn encode_signed_eip1559(signed_tx: &SignedTransaction) -> Vec<u8>
     result
 }
 
-/// 估算简单转账的 Gas 限制
-/// 
-/// # 返回
-/// - 21000（标准转账 Gas）
-fn simple_transfer_gas() -> u64
-{
-    21000
-}
-
-// ============ 跨 crate 公开接口（只使用 Rust 标准类型）============
-
 /// 使用私钥（十六进制字符串）签名交易
 /// 
 /// # 参数
@@ -652,41 +569,4 @@ pub fn sign_transaction_with_hex(tx: &Transaction, private_key_hex: &str) -> Res
 {
     let private_key = conversion::hex_to_k256_u256(private_key_hex)?;
     sign_transaction(tx, &private_key)
-}
-
-/// 使用字符串值构建简单转账交易
-/// 
-/// # 参数
-/// - `to`: 接收地址
-/// - `value_hex`: 转账金额（Wei，十六进制字符串）
-/// - `chain_id`: 链 ID
-/// - `nonce`: nonce
-/// - `max_fee_per_gas_hex`: 最大费用（十六进制字符串）
-/// - `max_priority_fee_per_gas_hex`: 最大优先费用（十六进制字符串）
-/// 
-/// # 返回
-/// - Transaction 结构
-pub fn build_transfer_tx(
-    to: &str,
-    value_hex: &str,
-    chain_id: u64,
-    nonce: u64,
-    max_fee_per_gas_hex: &str,
-    max_priority_fee_per_gas_hex: &str,
-) -> Result<Transaction, String>
-{
-    let value = conversion::hex_to_k256_u256(value_hex)?;
-    let max_fee = conversion::hex_to_k256_u256(max_fee_per_gas_hex)?;
-    let max_priority_fee = conversion::hex_to_k256_u256(max_priority_fee_per_gas_hex)?;
-    
-    TransactionBuilder::new()
-        .tx_type(TxType::Eip1559)
-        .to(to)
-        .value(value)
-        .chain_id(chain_id)
-        .nonce(nonce)
-        .gas_limit(simple_transfer_gas())
-        .max_fee_per_gas(max_fee)
-        .max_priority_fee_per_gas(max_priority_fee)
-        .build()
 }

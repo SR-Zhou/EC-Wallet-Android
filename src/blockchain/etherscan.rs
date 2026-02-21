@@ -65,12 +65,6 @@ impl EtherscanClient
         }
     }
 
-    /// 创建 Ethereum 主网的 Etherscan 客户端
-    pub fn ethereum_mainnet(api_key: &str) -> Self
-    {
-        Self::new("https://api.etherscan.io", api_key, 1)
-    }
-
     /// 获取地址的普通交易历史
     ///
     /// # 参数

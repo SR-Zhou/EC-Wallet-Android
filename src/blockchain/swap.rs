@@ -41,8 +41,8 @@ pub fn is_chain_supported(chain_id: u64) -> bool
 
 // ============ 报价 ============
 
+#[allow(dead_code)]
 /// 交换报价结果
-#[derive(Debug, Clone)]
 pub struct SwapQuote
 {
     /// 预计输出数量（最小单位）
@@ -51,8 +51,6 @@ pub struct SwapQuote
     pub amount_out_hex: String,
     /// 预计 Gas 费用
     pub estimated_gas: u128,
-    /// 价格影响（保留，暂为 0）
-    pub price_impact: f64,
 }
 
 /// 获取交换报价
@@ -137,7 +135,6 @@ pub async fn get_quote(
         amount_out,
         amount_out_hex,
         estimated_gas,
-        price_impact: 0.0,
     })
 }
 

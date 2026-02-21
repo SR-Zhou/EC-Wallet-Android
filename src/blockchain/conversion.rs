@@ -190,31 +190,3 @@ pub fn is_valid_private_key(hex: &str) -> bool
     }
 }
 
-/// 解析 Wei 值字符串
-/// 
-/// # 参数
-/// - `wei_str`: Wei 值的十六进制或十进制字符串
-/// 
-/// # 返回
-/// - 解析后的十六进制字符串（用于内部存储）
-/// 
-/// # 支持的格式
-/// - 十六进制: "0x..." 
-/// - 十进制: "1000000000000000000"
-pub fn parse_wei(wei_str: &str) -> Result<String, String>
-{
-    if wei_str.starts_with("0x") || wei_str.starts_with("0X")
-    {
-        // 十六进制格式：String -> 字节数组（长度检查）验证
-        let bytes = utils::hex_to_bytes32(wei_str)?;
-        // 字节数组 -> String（标准化输出）
-        Ok(utils::bytes32_to_hex(&bytes))
-    }
-    else
-    {
-        // 尝试解析为十进制
-        let value: u128 = wei_str.parse()
-            .map_err(|_| format!("Invalid wei value: {}", wei_str))?;
-        Ok(format!("0x{:x}", value))
-    }
-}

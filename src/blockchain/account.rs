@@ -3,7 +3,6 @@
 //! 
 //! 跨 crate 接口只使用 Rust 标准类型（String、字节数组、基础整数类型）
 
-use super::rpc::RpcClient;
 use super::utils;
 use super::conversion;
 
@@ -49,24 +48,4 @@ pub fn private_key_hex_to_address(private_key_hex: &str) -> Result<String, Strin
 {
     let private_key = conversion::hex_to_fr(private_key_hex)?;
     Ok(conversion::fr_to_address(&private_key))
-}
-
-/// 查询账户余额
-/// 
-/// # 参数
-/// - `rpc`: RPC 客户端
-/// - `address`: 账户地址
-/// 
-/// # 返回
-/// - 余额的十六进制字符串（Wei 单位，带 0x 前缀）
-/// 
-/// # 示例
-/// ```
-/// let balance_hex = get_balance(&rpc, "0x...").await?;
-/// let ether = conversion::wei_hex_to_ether(&balance_hex)?;
-/// ```
-pub async fn get_balance(rpc: &RpcClient, address: &str) -> Result<String, String>
-{
-    let formatted = utils::format_address(address);
-    rpc.eth_get_balance(&formatted, "latest").await
 }

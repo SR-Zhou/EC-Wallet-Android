@@ -1,6 +1,6 @@
 //! 工具函数模块
 //! 提供通用的工具函数（单位转换、地址校验、十六进制处理等）
-
+#![allow(dead_code)]
 use sha3::{Digest, Keccak256};
 
 /// 将 Wei 转换为 Ether
