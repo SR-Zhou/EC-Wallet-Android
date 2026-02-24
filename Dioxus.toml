@@ -1,5 +1,7 @@
 [application]
-name = "EC-Wallet"
+android_min_sdk_version = 27
+android_manifest = "AndroidManifest.xml"
 
 [bundle]
 identifier = "com.ec.wallet"
+version = "1.0.0"

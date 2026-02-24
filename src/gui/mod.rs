@@ -370,7 +370,7 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
             error_msg.set(String::new());
 
             let keystore_path = get_wallet_keystore_path(&wid);
-            match crypto::keystore::load(pw, &keystore_path, true)
+            match crypto::keystore::load(pw, &keystore_path, false)
             {
                 Ok(sk_hex) =>
                 {
@@ -378,7 +378,7 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
                     {
                         Ok(addr) =>
                         {
-                            // 更新钱包列表中的地址和公钥（迁移钱包可能缺失）
+                            // 更新钱包列表中的地址和公钥
                             let mut list = load_wallet_list();
                             if let Some(w) = list.wallets.iter_mut().find(|w| w.id == wid)
                             {
@@ -574,7 +574,7 @@ fn ImportPage(page: Signal<Page>) -> Element
 
         // 存储 keystore 文件
         let keystore_path = get_wallet_keystore_path(&wallet_id);
-        match crypto::keystore::store(pw, sk_clean.clone(), &keystore_path, true)
+        match crypto::keystore::store(pw, sk_clean.clone(), &keystore_path, false)
         {
             Ok(()) =>
             {
