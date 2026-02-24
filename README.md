@@ -18,7 +18,11 @@ An EVM Chain Cryptocurrency Wallet for Android.
 
 **Note:** The following steps use Debian as an example. The process for Windows or other Linux distributions is similar.
 
-1. Install Rust (>=1.88.0) and configure the Android toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` `rustup toolchain add aarch64-linux-android`
+1. Install Rust (>=1.88.0) and configure the Android toolchain:
+
+   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+
+   `rustup toolchain add aarch64-linux-android`
 
 2. Install `dioxus-cli`:
 
@@ -26,7 +30,9 @@ An EVM Chain Cryptocurrency Wallet for Android.
    cargo install dioxus-cli
    ```
 
-3. Install the JDK: `sudo apt install openjdk-11-jdk`
+3. Install the JDK:
+
+   `sudo apt install openjdk-11-jdk`
 
 4. Install the Android SDK:
 
@@ -45,7 +51,9 @@ An EVM Chain Cryptocurrency Wallet for Android.
 
    [android-ndk](https://dl.google.com/android/repository/android-ndk-r29-linux.zip)(Download and unzip it to /usr/local)
 
-6. Configure environment variables: Set `ANDROID_HOME` to point to the `android-sdk` and `ANDROID_NDK_HOME` to point to `android-ndk-r29`.
+6. Configure environment variables:
+
+   Set `ANDROID_HOME` to point to the `android-sdk` and `ANDROID_NDK_HOME` to point to `android-ndk-r29`.
 
 7. (Optional) Prepare a signing private key:
 
@@ -68,7 +76,11 @@ An EVM Chain Cryptocurrency Wallet for Android.
    chmod 600 ec.pem
    ```
 
-   (3) Generate a self-signed certificate based on the private key: `openssl req -new -x509 -key ec.pem -out cert.pem -days 10000` Follow the prompts to fill in information (Country, Org, etc.), or leave them blank.
+   (3) Generate a self-signed certificate based on the private key:
+
+   `openssl req -new -x509 -key ec.pem -out cert.pem -days 10000`
+
+   Follow the prompts to fill in information (Country, Org, etc.), or leave them blank.
 
    (4) Package as a PKCS12 JKS:
 
@@ -88,7 +100,9 @@ An EVM Chain Cryptocurrency Wallet for Android.
    key_password = "<your password>"
    ```
 
-8. Compile and Package: `dx build --release --target aarch64-linux-android --android`
+8. Compile and Package:
+
+   `dx build --release --target aarch64-linux-android --android`
 
 The packaged APK will be located at:
 
