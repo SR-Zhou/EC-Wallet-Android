@@ -16,7 +16,7 @@ An EVM Chain Cryptocurrency Wallet for Android.
 
 ## Build
 
-Note: The following steps use Debian as an example. The process for Windows or other Linux distributions is similar.
+**Note:** The following steps use Debian as an example. The process for Windows or other Linux distributions is similar.
 
 1. Install Rust (>=1.88.0) and configure the Android toolchain: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` `rustup toolchain add aarch64-linux-android`
 
@@ -30,23 +30,22 @@ Note: The following steps use Debian as an example. The process for Windows or o
 
 4. Install the Android SDK:
 
+   (1) Download [commandlinetools](https://developer.android.com/studio#command-tools)(Download "commandlinetools-xxxx-latest.zip" and unzip it to /usr/local)
+
+   (2) Download Android SDK
+
    ```
    cd /usr/local
-   wget [https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip](https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip)
-   unzip commandlinetools-linux-14742923_latest.zip
-   rm commandlinetools-linux-14742923_latest.zip
+   mkdir -p android-sdk/cmdline-tools
+   mv cmdline-tools android-sdk/cmdline-tools/latest 2>/dev/null || true
+   sudo android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=/usr/local/android-sdk "build-tools;36.0.0" "platforms;android-36"
    ```
 
 5. Install the Android NDK:
 
-   ```
-   cd /usr/local
-   wget [https://dl.google.com/android/repository/android-ndk-r29-linux.zip](https://dl.google.com/android/repository/android-ndk-r29-linux.zip)
-   unzip android-ndk-r29-linux.zip
-   rm android-ndk-r29-linux.zip
-   ```
+   [android-ndk](https://dl.google.com/android/repository/android-ndk-r29-linux.zip)(Download and unzip it to /usr/local)
 
-6. Configure environment variables: Set `ANDROID_HOME` to point to the Android SDK and `ANDROID_NDK_HOME` to point to `android-ndk-r29`.
+6. Configure environment variables: Set `ANDROID_HOME` to point to the `android-sdk` and `ANDROID_NDK_HOME` to point to `android-ndk-r29`.
 
 7. (Optional) Prepare a signing private key:
 
@@ -95,3 +94,5 @@ The packaged APK will be located at:
 
 - `target/dx/ECWallet/release/android/app/app/build/outputs/apk/debug/app-debug.apk` (Unsigned)
 - `target/dx/ECWallet/release/android/app/app/build/outputs/apk/release/app-release.apk` (Signed)
+
+**Note:** If the build fails, ensure the NDK path matches the configuration in `.cargo/config.toml`.
