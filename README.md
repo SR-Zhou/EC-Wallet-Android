@@ -32,7 +32,7 @@ An EVM Chain Cryptocurrency Wallet for Android.
 
 3. Install the JDK:
 
-   `sudo apt install openjdk-11-jdk`
+   `sudo apt install openjdk-25-jdk`
 
 4. Install the Android SDK:
 
