@@ -2,6 +2,8 @@ use crate::blockchain;
 use crate::crypto;
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use zeroize::Zeroize;
 
 // ============ 常量 ============
@@ -17,7 +19,7 @@ enum Page
 {
     /// 钱包列表页面（选择/管理钱包）
     WalletList,
-    /// 登录/解锁页面（指定钱包 id）
+    /// 登录/解锁页面（指定钱包 id，仅在签名时弹出）
     Login(String),
     /// 导入钱包页面
     Import,
@@ -29,6 +31,39 @@ enum Page
     Receive,
     /// 交换页面
     Swap,
+    /// 交易详情页面
+    TransactionDetail(TxRecord),
+    /// 资产详情页面（链+代币的余额和交易记录）
+    AssetDetail {
+        chain_id: u64,
+        chain_name: String,
+        token: TokenType,
+        symbol: String,
+    },
+}
+
+/// 待执行的操作（签名后自动执行）
+#[derive(Debug, Clone)]
+enum PendingOp
+{
+    None,
+    Send {
+        recipient: String,
+        amount_units: u128,
+        token: TokenType,
+        gas_percent: u32,
+        chain: ChainInfo,
+    },
+    Swap {
+        token_in_addr: String,
+        token_out_addr: String,
+        amount_in: u128,
+        amount_out_min: u128,
+        fee: u32,
+        recipient: String,
+        chain_id: u64,
+        rpc_url: String,
+    },
 }
 
 // ============ 钱包列表数据结构 ============
@@ -62,7 +97,7 @@ struct WalletList
 }
 
 /// 简化的交易记录（用于 UI 显示）
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TxRecord
 {
     pub hash: String,
@@ -189,19 +224,6 @@ fn all_chains() -> Vec<ChainInfo>
             explorer_url: "https://bscscan.com",
         },
         ChainInfo {
-            name: "Avalanche C-Chain",
-            short_name: "Avalanche",
-            chain_id: 43114,
-            rpc_url: "https://api.avax.network/ext/bc/C/rpc",
-            native_symbol: "AVAX",
-            native_icon: "🔺",
-            chain_icon: "🔺",
-            usdc_address: Some("0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"),
-            usdt_address: Some("0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://snowtrace.io",
-        },
-        ChainInfo {
             name: "zkSync Era",
             short_name: "zkSync",
             chain_id: 324,
@@ -250,7 +272,7 @@ fn default_chain() -> ChainInfo
 }
 
 /// 支持的代币类型
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum TokenType
 {
     Native,
@@ -318,24 +340,28 @@ fn app() -> Element
         }
         else if let Some(ref default_id) = list.default_wallet_id
         {
-            Page::Login(default_id.clone())
+            *CURRENT_WALLET_ID.write() = Some(default_id.clone());
+            Page::Wallet
         }
         else
         {
             Page::WalletList
         }
     });
+    let page_stack = use_signal(|| Vec::<Page>::new());
     rsx! {
         style { {CSS} }
         div { class: "app-container",
             match page() {
                 Page::WalletList => rsx! { WalletListPage { page } },
-                Page::Login(wallet_id) => rsx! { LoginPage { page, wallet_id } },
+                Page::Login(wallet_id) => rsx! { LoginPage { page, page_stack, wallet_id } },
                 Page::Import => rsx! { ImportPage { page } },
-                Page::Wallet => rsx! { WalletPage { page } },
-                Page::Send => rsx! { SendPage { page } },
-                Page::Receive => rsx! { ReceivePage { page } },
-                Page::Swap => rsx! { SwapPage { page } },
+                Page::Wallet => rsx! { WalletPage { page, page_stack } },
+                Page::Send => rsx! { SendPage { page, page_stack } },
+                Page::Receive => rsx! { ReceivePage { page, page_stack } },
+                Page::Swap => rsx! { SwapPage { page, page_stack } },
+                Page::TransactionDetail(tx) => rsx! { TransactionDetailPage { page, page_stack, tx } },
+                Page::AssetDetail { chain_id, chain_name, token, symbol } => rsx! { AssetDetailPage { page, page_stack, chain_id, chain_name, token, symbol } },
             }
         }
     }
@@ -344,7 +370,7 @@ fn app() -> Element
 // ============ 登录页面 ============
 
 #[component]
-fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
+fn LoginPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, wallet_id: String) -> Element
 {
     let mut password = use_signal(|| String::new());
     let error_msg = use_signal(|| String::new());
@@ -357,9 +383,9 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
     let wallet_address = wallet_info.as_ref().map(|w| shorten_address(&w.address)).unwrap_or_default();
     let wid = wallet_id.clone();
 
-    let do_unlock_fn = {
+    let do_unlock = {
         let wid = wid.clone();
-        move |password: &Signal<String>, mut error_msg: Signal<String>, mut loading: Signal<bool>, mut page: Signal<Page>| {
+        move |password: &Signal<String>, mut error_msg: Signal<String>, mut loading: Signal<bool>| {
             let pw = password().trim().to_string();
             if pw.is_empty()
             {
@@ -374,45 +400,8 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
             {
                 Ok(sk_hex) =>
                 {
-                    match blockchain::account::private_key_hex_to_address(&sk_hex)
-                    {
-                        Ok(addr) =>
-                        {
-                            // 更新钱包列表中的地址和公钥
-                            let mut list = load_wallet_list();
-                            if let Some(w) = list.wallets.iter_mut().find(|w| w.id == wid)
-                            {
-                                let mut changed = false;
-                                if w.address.starts_with('（') || w.address.is_empty()
-                                {
-                                    w.address = addr;
-                                    changed = true;
-                                }
-                                if w.public_key_x.is_empty()
-                                {
-                                    if let Ok((px, py)) = blockchain::account::private_key_hex_to_public_key_xy(&sk_hex)
-                                    {
-                                        w.public_key_x = px;
-                                        w.public_key_y = py;
-                                        changed = true;
-                                    }
-                                }
-                                if changed
-                                {
-                                    save_wallet_list(&list);
-                                }
-                            }
-
-                            // 记录当前活跃钱包 id
-                            *CURRENT_WALLET_ID.write() = Some(wid.clone());
-                            UNLOCKED_SK.write().replace(sk_hex);
-                            page.set(Page::Wallet);
-                        }
-                        Err(e) =>
-                        {
-                            error_msg.set(format!("私钥无效: {}", e));
-                        }
-                    }
+                    // 设置 SK（调用方会在操作完成后 zeroize）
+                    UNLOCKED_SK.write().replace(sk_hex);
                 }
                 Err(e) =>
                 {
@@ -423,23 +412,60 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
         }
     };
 
-    let go_import = move |_: Event<MouseData>| {
-        page.set(Page::Import);
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
     };
 
-    let go_wallet_list = move |_: Event<MouseData>| {
-        page.set(Page::WalletList);
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
     };
 
-    let has_multiple_wallets = wallet_list.wallets.len() > 1;
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
+            }
+        }
+    };
+
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
+    };
+
+    let error = error_msg;
+    let pw = password;
 
     rsx! {
-        div { class: "page login-page",
+        div {
+            class: "page login-page {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
             div { class: "card",
                 h1 { class: "title", "🔐 EC Wallet" }
-                p { class: "subtitle", "解锁钱包: {wallet_name}" }
+                p { class: "subtitle", "签名: {wallet_name}" }
                 if !wallet_address.is_empty() {
-                    p { class: "subtitle", style: "margin-top: -16px; font-family: monospace; font-size: 12px; color: #666;", "{wallet_address}" }
+                    p { class: "subtitle", style: "margin-top: -16px; font-family: monospace; font-size: 12px; color: #999;", "{wallet_address}" }
                 }
 
                 div { class: "form-group",
@@ -450,10 +476,13 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
                         value: "{password}",
                         oninput: move |e| password.set(e.value()),
                         onkeypress: {
-                            let do_unlock_fn = do_unlock_fn.clone();
+                            let do_unlock = do_unlock.clone();
                             move |e: Event<KeyboardData>| {
                                 if e.key() == Key::Enter {
-                                    do_unlock_fn(&password, error_msg, loading, page);
+                                    do_unlock(&pw, error, loading);
+                                    if UNLOCKED_SK.read().is_some() {
+                                        go_back();
+                                    }
                                 }
                             }
                         },
@@ -467,25 +496,25 @@ fn LoginPage(page: Signal<Page>, wallet_id: String) -> Element
                 button {
                     class: "btn btn-primary",
                     disabled: loading(),
-                    onclick: move |_: Event<MouseData>| do_unlock_fn(&password, error_msg, loading, page),
-                    if loading() { "解锁中..." } else { "解锁" }
+                    onclick: {
+                        let do_unlock = do_unlock.clone();
+                        move |_: Event<MouseData>| {
+                            do_unlock(&pw, error, loading);
+                            // 解锁成功后自动返回
+                            if UNLOCKED_SK.read().is_some() {
+                                go_back();
+                            }
+                        }
+                    },
+                    if loading() { "解锁中..." } else { "🔓 解锁并签名" }
                 }
 
                 div { class: "divider" }
 
-                if has_multiple_wallets {
-                    button {
-                        class: "btn btn-secondary",
-                        style: "margin-bottom: 8px;",
-                        onclick: go_wallet_list,
-                        "📋 切换钱包"
-                    }
-                }
-
                 button {
                     class: "btn btn-secondary",
-                    onclick: go_import,
-                    "导入新钱包"
+                    onclick: move |_| go_back(),
+                    "← 返回"
                 }
             }
         }
@@ -602,7 +631,6 @@ fn ImportPage(page: Signal<Page>) -> Element
                 save_wallet_list(&list);
 
                 *CURRENT_WALLET_ID.write() = Some(wallet_id);
-                UNLOCKED_SK.write().replace(sk_clean);
                 page.set(Page::Wallet);
             }
             Err(e) =>
@@ -619,7 +647,8 @@ fn ImportPage(page: Signal<Page>) -> Element
         {
             if let Some(ref default_id) = list.default_wallet_id
             {
-                page.set(Page::Login(default_id.clone()));
+                *CURRENT_WALLET_ID.write() = Some(default_id.clone());
+                page.set(Page::Wallet);
             }
             else
             {
@@ -722,7 +751,8 @@ fn WalletListPage(page: Signal<Page>) -> Element
     let mut rename_input = use_signal(|| String::new());
 
     let mut on_select = move |id: String| {
-        page.set(Page::Login(id));
+        *CURRENT_WALLET_ID.write() = Some(id.clone());
+        page.set(Page::Wallet);
     };
 
     let mut on_set_default = move |id: String| {
@@ -762,7 +792,7 @@ fn WalletListPage(page: Signal<Page>) -> Element
 
             div { class: "card",
                 h2 { class: "section-title", "📋 钱包列表" }
-                p { class: "subtitle", style: "text-align: left; margin-bottom: 16px;", "选择要解锁的钱包，或导入新钱包" }
+                p { class: "subtitle", style: "text-align: left; margin-bottom: 16px;", "选择要使用的钱包，或导入新钱包" }
 
                 div { class: "wallet-list",
                     {
@@ -831,7 +861,7 @@ fn WalletListPage(page: Signal<Page>) -> Element
                                                                 "取消"
                                                             }
                                                         }
-                                                    }                                                    div {
+                                                    } div {
                                                         class: "wallet-list-actions",
                                                         if !is_default {
                                                             button {
@@ -916,20 +946,19 @@ fn WalletListPage(page: Signal<Page>) -> Element
 
 // ============ 钱包主页面 ============
 
-#[component]
-fn WalletPage(page: Signal<Page>) -> Element
+#[derive(Debug, Clone, PartialEq)]
+enum HomeTab
 {
-    let address = use_signal(|| {
-        let sk = UNLOCKED_SK.read();
-        match sk.as_ref()
-        {
-            Some(sk_hex) => blockchain::account::private_key_hex_to_address(sk_hex)
-                .unwrap_or_else(|_| "地址计算错误".to_string()),
-            None => "未解锁".to_string(),
-        }
-    });
+    Home,
+    Assets,
+}
+
+#[component]
+fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
+{
+    let address = get_current_wallet_address();
     let mut selected_token = use_signal(|| TokenType::Native);
-    let mut show_chain_modal = use_signal(|| false);
+    let mut show_chain_dropdown = use_signal(|| false);
     let mut show_wallet_dropdown = use_signal(|| false);
     let mut show_wallet_detail: Signal<Option<WalletInfo>> = use_signal(|| None);
     let mut renaming_id: Signal<Option<String>> = use_signal(|| None);
@@ -942,69 +971,140 @@ fn WalletPage(page: Signal<Page>) -> Element
     let mut tx_error = use_signal(|| String::new());
     let mut api_key_input = use_signal(|| ETHERSCAN_KEY.read().clone());
     let mut api_key_saved = use_signal(|| false);
+    let refresh_counter = use_signal(|| 0u32);
+    let mut balance_refresh_counter = use_signal(|| 0u32);
+    let mut tx_refresh_counter = use_signal(|| 0u32);
+    let mut current_tab = use_signal(|| HomeTab::Home);
 
-    let addr = address();
+    let addr = address.clone();
     let addr_for_tx = addr.clone();
 
-    // 余额随 selected_token / selected_chain 变化而重新获取
+    // 从文件加载缓存到内存（先清空旧钱包数据，再加载新钱包缓存）
+    {
+        let mut balance_cache = BALANCE_CACHE.write();
+        let mut tx_cache = TX_CACHE.write();
+        *balance_cache = HashMap::new();
+        *tx_cache = HashMap::new();
+        if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+            if let Some(cache) = load_wallet_cache(wid) {
+                *balance_cache = cache.balances;
+                *tx_cache = cache.transactions;
+            }
+        }
+    }
+
+    // 余额随 selected_token / selected_chain / refresh 变化而获取（优先使用缓存）
+    let address_for_balance = address.clone();
     use_effect(move || {
-        let addr = address().clone();
+        let _ = refresh_counter();
+        let _ = balance_refresh_counter();
+        let addr = address_for_balance.clone();
         let token = selected_token().clone();
         let chain = SELECTED_CHAIN.read().clone();
-        balance.set("加载中...".to_string());
-        spawn(async move {
-            match fetch_token_balance(&addr, &token, &chain).await
-            {
-                Ok(bal) => balance.set(bal),
+        let cache_key = balance_key(chain.chain_id, &token);
+
+        // 检查缓存
+        if let Some(cached) = BALANCE_CACHE.read().get(&cache_key) {
+            match cached {
+                Ok(bal) => balance.set(truncate_balance_for_display(bal)),
                 Err(e) => balance.set(format!("错误: {}", e)),
             }
+            return;
+        }
+
+        // 无缓存，从网络获取（去重：同一 key 只发一次请求）
+        if IN_FLIGHT.read().contains(&cache_key) {
+            return;
+        }
+        IN_FLIGHT.write().insert(cache_key.clone());
+        balance.set("加载中...".to_string());
+        spawn(async move {
+            let wallet_id = CURRENT_WALLET_ID.read().clone();
+            match fetch_token_balance(&addr, &token, &chain).await
+            {
+                Ok(bal) => {
+                    BALANCE_CACHE.write().insert(cache_key.clone(), Ok(bal.clone()));
+                    balance.set(truncate_balance_for_display(&bal));
+                    if let Some(ref wid) = wallet_id {
+                        save_wallet_cache(wid);
+                    }
+                }
+                Err(e) => {
+                    BALANCE_CACHE.write().insert(cache_key.clone(), Err(e.clone()));
+                    balance.set(format!("错误: {}", e));
+                    if let Some(ref wid) = wallet_id {
+                        save_wallet_cache(wid);
+                    }
+                }
+            }
+            IN_FLIGHT.write().remove(&cache_key);
         });
     });
 
+    // 交易记录随 selected_chain / refresh 变化而获取（优先使用缓存）
     use_effect(move || {
+        let _ = refresh_counter();
+        let _ = tx_refresh_counter();
         let addr = addr_for_tx.clone();
         let chain = SELECTED_CHAIN.read().clone();
+        let chain_id = chain.chain_id;
+
+        // 检查缓存
+        if let Some(cached) = TX_CACHE.read().get(&chain_id) {
+            match cached {
+                Ok(txs) => {
+                    tx_error.set(String::new());
+                    transactions.set(txs.clone());
+                }
+                Err(e) => {
+                    transactions.set(Vec::new());
+                    tx_error.set(format!("获取交易历史失败: {}", e));
+                }
+            }
+            return;
+        }
+
+        // 无缓存，从网络获取
+        // 无缓存，从网络获取（去重：同一链只发一次 tx 请求）
+        let tx_flight_key = format!("tx_{}", chain_id);
+        if IN_FLIGHT.read().contains(&tx_flight_key) {
+            return;
+        }
+        IN_FLIGHT.write().insert(tx_flight_key.clone());
         tx_loading.set(true);
         tx_error.set(String::new());
         spawn(async move {
+            let wallet_id = CURRENT_WALLET_ID.read().clone();
             match fetch_transactions(&addr, &chain).await
             {
                 Ok(txs) =>
                 {
+                    TX_CACHE.write().insert(chain_id, Ok(txs.clone()));
+                    tx_error.set(String::new());
                     transactions.set(txs);
+                    if let Some(ref wid) = wallet_id {
+                        save_wallet_cache(wid);
+                    }
                 }
                 Err(e) =>
                 {
+                    TX_CACHE.write().insert(chain_id, Err(e.clone()));
+                    transactions.set(Vec::new());
                     tx_error.set(format!("获取交易历史失败: {}", e));
+                    if let Some(ref wid) = wallet_id {
+                        save_wallet_cache(wid);
+                    }
                 }
             }
             tx_loading.set(false);
+            IN_FLIGHT.write().remove(&tx_flight_key);
         });
     });
 
-    let on_lock = move |_| {
-        // 安全清除内存中的私钥
-        if let Some(mut sk) = UNLOCKED_SK.write().take() {
-            sk.zeroize();
-        }
-        *CURRENT_WALLET_ID.write() = None;
-        let list = load_wallet_list();
-        if let Some(ref default_id) = list.default_wallet_id
-        {
-            page.set(Page::Login(default_id.clone()));
-        }
-        else if !list.wallets.is_empty()
-        {
-            page.set(Page::WalletList);
-        }
-        else
-        {
-            page.set(Page::Import);
-        }
-    };
-    let addr_display = address();
+    let addr_display = address.clone();
     let short_addr = shorten_address(&addr_display);
     let chain = SELECTED_CHAIN.read().clone();
+    let current_chain_id = chain.chain_id;
     let native_symbol = chain.native_symbol.to_string();
     let native_icon = chain.native_icon;
     let chain_display_name = chain.short_name.to_string();
@@ -1015,7 +1115,7 @@ fn WalletPage(page: Signal<Page>) -> Element
         div { class: "page wallet-page",
             div { class: "topbar",
                 span { class: "topbar-title", "🔷 EC Wallet" }
-                button { class: "btn btn-small btn-danger", onclick: on_lock, "🔒 锁定" }
+                span {}
             }
 
             // ---- 钱包选择器按钮 ----
@@ -1032,7 +1132,7 @@ fn WalletPage(page: Signal<Page>) -> Element
                         button {
                             class: "wallet-selector-btn",
                             onclick: move |_| show_wallet_dropdown.set(!show_wallet_dropdown()),
-                            span { class: "wallet-selector-icon", "👛" }
+                            span { class: "wallet-selector-icon", "📋" }
                             span { class: "wallet-selector-name", "{current_wallet_name}" }
                             span { class: "wallet-selector-arrow", if show_wallet_dropdown() { "▴" } else { "▾" } }
                         }
@@ -1061,9 +1161,9 @@ fn WalletPage(page: Signal<Page>) -> Element
                                                     class: "wallet-dropdown-main",
                                                     onclick: move |_| {
                                                         if !is_current {
-                                                            // 切换到该钱包，需要重新解锁
-                                                            UNLOCKED_SK.write().take();
-                                                            page.set(Page::Login(w_id.clone()));
+                                                            // 切换到该钱包
+                                                            *CURRENT_WALLET_ID.write() = Some(w_id.clone());
+                                                            page.set(Page::Wallet);
                                                         }
                                                         show_wallet_dropdown.set(false);
                                                     },
@@ -1160,7 +1260,7 @@ fn WalletPage(page: Signal<Page>) -> Element
                                                                         // 如果删除的是当前钱包，返回钱包列表页面
                                                                         if del_id == curr_wid {
                                                                             save_wallet_list(&list);
-                                                                            UNLOCKED_SK.write().take();
+                                                                            *CURRENT_WALLET_ID.write() = None;
                                                                             page.set(Page::WalletList);
                                                                         } else {
                                                                             save_wallet_list(&list);
@@ -1194,12 +1294,20 @@ fn WalletPage(page: Signal<Page>) -> Element
 
                                 div { class: "wallet-dropdown-footer",
                                     button {
-                                        class: "btn btn-small btn-primary",
+                                        class: "btn btn-small btn-secondary",
+                                        onclick: move |_| {
+                                            show_wallet_dropdown.set(false);
+                                            page.set(Page::WalletList);
+                                        },
+                                        "钱包列表"
+                                    }
+                                    button {
+                                        class: "btn btn-small btn-secondary",
                                         onclick: move |_| {
                                             show_wallet_dropdown.set(false);
                                             page.set(Page::Import);
                                         },
-                                        "➕ 导入新钱包"
+                                        "导入新钱包"
                                     }
                                 }
                             }
@@ -1208,15 +1316,47 @@ fn WalletPage(page: Signal<Page>) -> Element
                 }
             }
 
-            // ---- 链选择器按钮 ----
-            button {
-                class: "chain-selector-btn",
-                onclick: move |_| show_chain_modal.set(true),
-                span { class: "chain-selector-icon", "{chain_icon}" }
-                span { class: "chain-selector-name", "{chain_display_name}" }
-                span { class: "chain-selector-arrow", "▾" }
+            // ---- 链选择器 ----下拉 ----
+            div { class: "chain-selector-container",
+                button {
+                    class: "chain-selector-btn",
+                    onclick: move |_| show_chain_dropdown.set(!show_chain_dropdown()),
+                    span { class: "chain-selector-icon", "{chain_icon}" }
+                    span { class: "chain-selector-name", "{chain_display_name}" }
+                    span { class: "chain-selector-arrow", if show_chain_dropdown() { "▴" } else { "▾" } }
+                }
+
+                if show_chain_dropdown() {
+                    div { class: "chain-dropdown",
+                        for chain in all_chains() {
+                            {
+                                let is_active = chain.chain_id == current_chain_id;
+                                let chain_for_click = chain.clone();
+                                rsx! {
+                                    button {
+                                        class: if is_active { "chain-item active" } else { "chain-item" },
+                                        onclick: move |_| {
+                                            *SELECTED_CHAIN.write() = chain_for_click.clone();
+                                            selected_token.set(TokenType::Native);
+                                            show_chain_dropdown.set(false);
+                                        },
+                                        span { class: "chain-item-icon", "{chain.chain_icon}" }
+                                        div { class: "chain-item-info",
+                                            span { class: "chain-item-name", "{chain.name}" }
+                                            span { class: "chain-item-detail", "{chain.native_symbol} · Chain ID: {chain.chain_id}" }
+                                        }
+                                        if is_active {
+                                            span { class: "chain-item-check", "✓" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
+            if current_tab() == HomeTab::Home {
             div { class: "token-tabs",
                 button {
                     class: if selected_token() == TokenType::Native { "token-tab active" } else { "token-tab" },
@@ -1241,6 +1381,22 @@ fn WalletPage(page: Signal<Page>) -> Element
             }
 
             div { class: "card account-card",
+                div { class: "account-header",
+                    span { class: "section-title", "余额" }
+                    button {
+                        class: "btn btn-small btn-secondary",
+                        onclick: move |_| {
+                            let chain = SELECTED_CHAIN.read().clone();
+                            let token = selected_token();
+                            BALANCE_CACHE.write().remove(&balance_key(chain.chain_id, &token));
+                            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                                save_wallet_cache(wid);
+                            }
+                            balance_refresh_counter.set(balance_refresh_counter() + 1);
+                        },
+                        "刷新"
+                    }
+                }
                 div { class: "account-address",
                     span { class: "label", "地址" }
                     span { class: "address", title: "{addr_display}", "{short_addr}" }
@@ -1252,20 +1408,47 @@ fn WalletPage(page: Signal<Page>) -> Element
                 div { class: "action-buttons",
                     button {
                         class: "btn btn-action",
-                        onclick: move |_| page.set(Page::Send),
+                        onclick: move |_| {
+                            page_stack.write().push(Page::Wallet);
+                            page.set(Page::Send);
+                        },
                         "📤 发送"
                     }
                     button {
                         class: "btn btn-action",
-                        onclick: move |_| page.set(Page::Receive),
+                        onclick: move |_| {
+                            page_stack.write().push(Page::Wallet);
+                            page.set(Page::Receive);
+                        },
                         "📥 接收"
                     }
-                    button { class: "btn btn-action", onclick: move |_| page.set(Page::Swap), "🔄 交换" }
+                    button {
+                        class: "btn btn-action",
+                        onclick: move |_| {
+                            page_stack.write().push(Page::Wallet);
+                            page.set(Page::Swap);
+                        },
+                        "🔄 交换"
+                    }
                 }
             }
 
             div { class: "card tx-card",
-                h2 { class: "section-title", "📋 交易历史" }
+                div { class: "tx-header",
+                    h2 { class: "section-title", "交易历史" }
+                    button {
+                        class: "btn btn-small btn-secondary",
+                        onclick: move |_| {
+                            let chain = SELECTED_CHAIN.read().clone();
+                            TX_CACHE.write().remove(&chain.chain_id);
+                            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                                save_wallet_cache(wid);
+                            }
+                            tx_refresh_counter.set(tx_refresh_counter() + 1);
+                        },
+                        "刷新"
+                    }
+                }
 
                 if tx_loading() {
                     p { class: "loading-text", "加载交易历史中..." }
@@ -1281,7 +1464,7 @@ fn WalletPage(page: Signal<Page>) -> Element
 
                 div { class: "tx-list",
                     for tx in transactions() {
-                        TxItem { tx: tx.clone(), my_address: addr_display.clone() }
+                        TxItem { tx: tx.clone(), my_address: addr_display.clone(), page, page_stack }
                     }
                 }
             }
@@ -1320,17 +1503,10 @@ fn WalletPage(page: Signal<Page>) -> Element
                     }
                 }
             }
-            // ---- 链选择模态窗口 ----
-            if show_chain_modal() {
-                ChainSelectorModal {
-                    on_close: move || show_chain_modal.set(false),
-                    on_select: move |chain: ChainInfo| {
-                        *SELECTED_CHAIN.write() = chain;
-                        // 切链后重置到 Native 代币
-                        selected_token.set(TokenType::Native);
-                        show_chain_modal.set(false);
-                    },
-                }
+            }
+
+            if current_tab() == HomeTab::Assets {
+                AssetsPage { address: address.clone(), refresh_counter, current_tab, page, page_stack }
             }
 
             // ---- 钱包详情模态窗口 ----
@@ -1341,23 +1517,397 @@ fn WalletPage(page: Signal<Page>) -> Element
                 }
             }
         }
+        // 底部导航栏
+        div { class: "bottom-bar",
+            button {
+                class: if current_tab() == HomeTab::Home { "bottom-bar-btn active" } else { "bottom-bar-btn" },
+                onclick: move |_| current_tab.set(HomeTab::Home),
+                "主页"
+            }
+            button {
+                class: if current_tab() == HomeTab::Assets { "bottom-bar-btn active" } else { "bottom-bar-btn" },
+                onclick: move |_| current_tab.set(HomeTab::Assets),
+                "资产"
+            }
+        }
+    }
+}
+
+// ============ 资产页面 ============
+
+#[derive(Debug, Clone, PartialEq)]
+struct AssetItem
+{
+    chain_id: u64,
+    chain_name: String,
+    token: TokenType,
+    symbol: String,
+    balance_str: String,
+    is_zero: bool,
+}
+
+/// 预定义调色板（最多支持 30 种代币-链组合）
+const ASSET_COLORS: &[&str] = &[
+    "#667eea", "#f093fb", "#4facfe", "#43e97b", "#fa709a",
+    "#fee140", "#30cfd0", "#a8c0ff", "#f86ca7", "#ff6b6b",
+    "#f9d423", "#00b4db", "#f5576c", "#005bea", "#48c6ef",
+    "#6bff6b", "#f9a826", "#a18cd1", "#ffecd2", "#fcb69f",
+    "#cfd9df", "#b24592", "#e14b5d", "#f3a183", "#4a00e0",
+    "#8e2de2", "#00bf8f", "#11998e", "#38ef7d", "#ffb347",
+];
+
+#[component]
+fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal<HomeTab>, page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
+{
+    let mut assets = use_signal(|| Vec::<AssetItem>::new());
+    let mut loading = use_signal(|| true);
+    let mut is_fetching = use_signal(|| false);
+    let assets_version = use_signal(|| 0u32);
+    let mut serial_trigger = use_signal(|| 0u32);
+
+    // 收集所有链 × 代币的数据（读取缓存），并触发串行加载
+    use_effect(move || {
+        let _ = refresh_counter();
+        let _ = serial_trigger();
+        loading.set(true);
+        let chains = all_chains();
+        let mut items = Vec::new();
+        let mut need_fetch = Vec::new();
+
+        for chain in &chains {
+            let tokens = vec![TokenType::Native, TokenType::USDC, TokenType::USDT];
+            for token in &tokens {
+                if *token == TokenType::USDC && chain.usdc_address.is_none() { continue; }
+                if *token == TokenType::USDT && chain.usdt_address.is_none() { continue; }
+
+                let cache_key = balance_key(chain.chain_id, &token);
+                if let Some(cached) = BALANCE_CACHE.read().get(&cache_key) {
+                    match cached {
+                        Ok(bal) => {
+                            let is_zero = bal == "0";
+                            items.push(AssetItem {
+                                chain_id: chain.chain_id,
+                                chain_name: chain.name.to_string(),
+                                token: token.clone(),
+                                symbol: token.symbol(chain).to_string(),
+                                balance_str: bal.clone(),
+                                is_zero,
+                            });
+                        }
+                        Err(e) => {
+                            items.push(AssetItem {
+                                chain_id: chain.chain_id,
+                                chain_name: chain.name.to_string(),
+                                token: token.clone(),
+                                symbol: token.symbol(chain).to_string(),
+                                balance_str: format!("错误: {}", e),
+                                is_zero: false,
+                            });
+                        }
+                    }
+                } else {
+                    need_fetch.push((chain.clone(), token.clone()));
+                    items.push(AssetItem {
+                        chain_id: chain.chain_id,
+                        chain_name: chain.name.to_string(),
+                        token: token.clone(),
+                        symbol: token.symbol(chain).to_string(),
+                        balance_str: "加载中...".to_string(),
+                        is_zero: false,
+                    });
+                }
+            }
+        }
+
+        assets.set(items);
+
+        // 串行获取未缓存的资产：逐对请求，全部完成后批量写入
+        if !need_fetch.is_empty() {
+            // 已有串行加载在跑则跳过，防止并发 spawn 抢锁卡死
+            if is_fetching() {
+                return;
+            }
+            is_fetching.set(true);
+            let addr = address.clone();
+            let mut version = assets_version;
+            spawn(async move {
+                let mut new_balances = HashMap::new();
+                let mut new_txs: HashMap<u64, Result<Vec<TxRecord>, String>> = HashMap::new();
+                let mut fetched_tx_chains = HashSet::new();
+
+                for (chain, token) in &need_fetch {
+                    let cache_key = balance_key(chain.chain_id, token);
+                    if IN_FLIGHT.read().contains(&cache_key) {
+                        continue;
+                    }
+                    IN_FLIGHT.write().insert(cache_key.clone());
+
+                    let bal_result = fetch_token_balance(&addr, token, chain).await;
+                    new_balances.insert(cache_key.clone(), bal_result);
+                    IN_FLIGHT.write().remove(&cache_key);
+
+                    let tx_flight_key = format!("tx_{}", chain.chain_id);
+                    if !fetched_tx_chains.contains(&chain.chain_id) && !IN_FLIGHT.read().contains(&tx_flight_key) {
+                        IN_FLIGHT.write().insert(tx_flight_key.clone());
+                        let tx_result = fetch_transactions(&addr, chain).await;
+                        new_txs.insert(chain.chain_id, tx_result);
+                        IN_FLIGHT.write().remove(&tx_flight_key);
+                        fetched_tx_chains.insert(chain.chain_id);
+                    }
+
+                    // 间隔 1 秒
+                    futures_timer::Delay::new(std::time::Duration::from_secs(1)).await;
+                }
+
+                // 全部完成后批量写入缓存
+                if !new_balances.is_empty() {
+                    let mut cache = BALANCE_CACHE.write();
+                    for (k, v) in new_balances {
+                        cache.insert(k, v);
+                    }
+                }
+                if !new_txs.is_empty() {
+                    let mut cache = TX_CACHE.write();
+                    for (k, v) in new_txs {
+                        cache.insert(k, v);
+                    }
+                }
+
+                // 一次性更新 UI
+                version.set(version() + 1);
+                loading.set(false);
+                is_fetching.set(false);
+
+                if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                    save_wallet_cache(wid);
+                }
+            });
+        } else {
+            loading.set(false);
+        }
+    });
+
+    // 排序：链顺序 → token顺序(Native,USDC,USDT) → 非0在前
+    let all_chains_list = all_chains();
+    let chain_order: HashMap<u64, usize> = all_chains_list.iter()
+        .enumerate()
+        .map(|(i, c)| (c.chain_id, i))
+        .collect();
+    let token_order: HashMap<TokenType, usize> = vec![
+        (TokenType::Native, 0),
+        (TokenType::USDC, 1),
+        (TokenType::USDT, 2),
+    ].into_iter().collect();
+
+    let mut sorted = assets();
+    sorted.sort_by(|a, b| {
+        let chain_a = chain_order.get(&a.chain_id).copied().unwrap_or(99);
+        let chain_b = chain_order.get(&b.chain_id).copied().unwrap_or(99);
+        if chain_a != chain_b { return chain_a.cmp(&chain_b); }
+        let tok_a = token_order.get(&a.token).copied().unwrap_or(99);
+        let tok_b = token_order.get(&b.token).copied().unwrap_or(99);
+        if tok_a != tok_b { return tok_a.cmp(&tok_b); }
+        // 非0在前
+        b.is_zero.cmp(&a.is_zero)
+    });
+
+    // 过滤：只显示有余额的资产（排除零余额、错误、加载中）
+    let filtered: Vec<&AssetItem> = sorted.iter()
+        .filter(|item| !item.is_zero && !item.balance_str.starts_with("错误") && item.balance_str != "加载中...")
+        .collect();
+
+    // 环图数据（仅非0且非错误）
+    let ring_data: Vec<(usize, &AssetItem, f64)> = {
+        let non_zero: Vec<&AssetItem> = sorted.iter()
+            .filter(|item| !item.is_zero && !item.balance_str.starts_with("错误") && item.balance_str != "加载中...")
+            .collect();
+        let total: f64 = non_zero.iter()
+            .filter_map(|item| item.balance_str.parse::<f64>().ok())
+            .sum();
+        if total > 0.0 {
+            non_zero.iter()
+                .enumerate()
+                .filter_map(|(idx, item)| {
+                    item.balance_str.parse::<f64>().ok().map(|val| (idx, *item, val / total))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let ring_cx = 180.0;
+    let ring_cy = 160.0;
+    let ring_r = 100.0;
+    let ring_inner = 55.0;
+
+    // 弧段路径
+    fn arc_path(cx: f64, cy: f64, r: f64, inner: f64, start_angle: f64, end_angle: f64) -> String
+    {
+        let sweep = end_angle - start_angle;
+        // 处理 360° 全圆（SVG 弧起止点相同会什么都不画）
+        if sweep.abs() >= 2.0 * std::f64::consts::PI - 0.001 {
+            let mid = start_angle + std::f64::consts::PI;
+            let first = arc_path_half(cx, cy, r, inner, start_angle, mid);
+            let second = arc_path_half(cx, cy, r, inner, mid, end_angle);
+            return format!("{} {}", first, second);
+        }
+        arc_path_half(cx, cy, r, inner, start_angle, end_angle)
+    }
+
+    fn arc_path_half(cx: f64, cy: f64, r: f64, inner: f64, start_angle: f64, end_angle: f64) -> String
+    {
+        let outer_x1 = cx + r * start_angle.cos();
+        let outer_y1 = cy + r * start_angle.sin();
+        let outer_x2 = cx + r * end_angle.cos();
+        let outer_y2 = cy + r * end_angle.sin();
+        let inner_x1 = cx + inner * end_angle.cos();
+        let inner_y1 = cy + inner * end_angle.sin();
+        let inner_x2 = cx + inner * start_angle.cos();
+        let inner_y2 = cy + inner * start_angle.sin();
+        let large = (end_angle - start_angle).abs() > std::f64::consts::PI;
+        format!(
+            "M {} {} A {} {} 0 {} 1 {} {} L {} {} A {} {} 0 {} 0 {} {} Z",
+            outer_x1, outer_y1, r, r, large as u8, outer_x2, outer_y2,
+            inner_x1, inner_y1, inner, inner, large as u8, inner_x2, inner_y2
+        )
+    }
+
+    let rsx_svg = if ring_data.is_empty() {
+        rsx! {
+            text { x: "{ring_cx}", y: "{ring_cy}", text_anchor: "middle", dominant_baseline: "middle",
+                font_size: "14", fill: "#999", "暂无资产" }
+        }
+    } else {
+        let mut angle = -std::f64::consts::PI / 2.0;
+        let mut paths = Vec::new();
+        for (idx, _item, ratio) in ring_data.iter() {
+            let sweep = 2.0 * std::f64::consts::PI * ratio;
+            let start_angle = angle;
+            let end_angle = angle + sweep;
+            let color = ASSET_COLORS[idx % ASSET_COLORS.len()];
+            let path = arc_path(ring_cx, ring_cy, ring_r, ring_inner, start_angle, end_angle);
+
+            let path_d = path;
+            let color_s = color.to_string();
+
+            paths.push(rsx! {
+                path { d: "{path_d}", fill: "{color_s}", opacity: "0.85", stroke: "#fff", stroke_width: "1" }
+            });
+            angle += sweep;
+        }
+
+        rsx! {
+            for path_elem in paths {
+                {path_elem}
+            }
+        }
+    };
+
+    // 图例数据：按环中顺序，去重
+    let mut legend: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+    for (_idx, item, _ratio) in &ring_data {
+        let label = format!("{} ({})", item.symbol, item.chain_name);
+        if seen.insert(label.clone()) {
+            // 用 ring_data 的索引对应颜色
+            let idx = legend.len();
+            let c = ASSET_COLORS[idx % ASSET_COLORS.len()].to_string();
+            legend.push((c, label));
+        }
+    }
+
+    rsx! {
+        div { class: "assets-page",
+            div { class: "assets-ring-container",
+                div { class: "assets-ring-header",
+                    span {} // placeholder for flex
+                    button {
+                        class: "btn btn-small btn-secondary",
+                        onclick: move |_| {
+                            // 清除当前链所有代币的缓存（一次批量写入）
+                            let chain = SELECTED_CHAIN.read().clone();
+                            {
+                                let mut cache = BALANCE_CACHE.write();
+                                cache.remove(&balance_key(chain.chain_id, &TokenType::Native));
+                                cache.remove(&balance_key(chain.chain_id, &TokenType::USDC));
+                                cache.remove(&balance_key(chain.chain_id, &TokenType::USDT));
+                            }
+                            TX_CACHE.write().remove(&chain.chain_id);
+                            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                                save_wallet_cache(wid);
+                            }
+                            serial_trigger.set(serial_trigger() + 1);
+                        },
+                        "刷新"
+                    }
+                }
+                if loading() {
+                    div { class: "assets-loading",
+                        div { class: "assets-spinner" }
+                        p { class: "loading-text", "加载资产中..." }
+                    }
+                } else {
+                    svg {
+                        view_box: "0 0 360 280",
+                        width: "100%",
+                        height: "auto",
+                        {rsx_svg}
+                    }
+                    // 图例（环下方，居中）
+                    if !legend.is_empty() {
+                        div { class: "ring-legend",
+                            for (color, label) in &legend {
+                                div { class: "ring-legend-item",
+                                    span {
+                                        class: "ring-legend-color",
+                                        style: "background: {color};",
+                                    }
+                                    span { class: "ring-legend-label", "{label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div { class: "asset-list",
+                for item in filtered {
+                    {
+                        let chain_id = item.chain_id;
+                        let chain_name = item.chain_name.clone();
+                        let token = item.token.clone();
+                        let symbol = item.symbol.clone();
+                        let mut p = page;
+                        let mut stack = page_stack;
+                        rsx! {
+                            div {
+                                class: "asset-item",
+                                onclick: move |_| {
+                                    stack.write().push(p());
+                                    p.set(Page::AssetDetail { chain_id, chain_name: chain_name.clone(), token: token.clone(), symbol: symbol.clone() });
+                                },
+                                div { class: "asset-item-left",
+                                    span { class: "asset-item-symbol", "{item.symbol} ({item.chain_name})" }
+                                }
+                                div { class: "asset-item-right",
+                                    span { class: "asset-item-balance", "{item.balance_str}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 // ============ 发送页面 ============
 
 #[component]
-fn SendPage(page: Signal<Page>) -> Element
+fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 {
-    let address = {
-        let sk = UNLOCKED_SK.read();
-        match sk.as_ref()
-        {
-            Some(sk_hex) => blockchain::account::private_key_hex_to_address(sk_hex)
-                .unwrap_or_else(|_| "地址计算错误".to_string()),
-            None => "未解锁".to_string(),
-        }
-    };
+    let address = get_current_wallet_address();
 
     let mut selected_token = use_signal(|| TokenType::Native);
     let mut recipient = use_signal(|| String::new());
@@ -1371,7 +1921,6 @@ fn SendPage(page: Signal<Page>) -> Element
 
     let my_addr = address.clone();
     let my_addr_for_max = my_addr.clone(); // 用于 on_set_max
-    let my_addr_for_send = my_addr.clone(); // 用于 on_send
 
     // 点击"全部"按钮的处理函数
     let on_set_max = move |_| {
@@ -1404,20 +1953,20 @@ fn SendPage(page: Signal<Page>) -> Element
             
             // 格式化为人类可读的字符串显示
             let decimals = token.decimals(&chain);
-            let display_str = format_units_to_decimal(balance_units, decimals);
+            let display_str = format_units_to_decimal(balance_units, decimals, None);
             amount_str.set(display_str);
             
             fetching_balance.set(false);
         });
     };
 
+    let address_for_send = address.clone();
     let on_send = move |_| {
         let to_addr = recipient().trim().to_string();
         let amount_input = amount_str().trim().to_string();
         let token = selected_token();
-        let from_addr = my_addr_for_send.clone();
         let chain = SELECTED_CHAIN.read().clone();
-        let gas_percent = gas_fee_percent(); // 获取选择的 gas fee 百分比
+        let gas_percent = gas_fee_percent();
 
         // 基本验证
         if to_addr.is_empty()
@@ -1436,75 +1985,71 @@ fn SendPage(page: Signal<Page>) -> Element
             return;
         }
 
-        let sk_hex = match UNLOCKED_SK.read().clone()
-        {
-            Some(sk) => sk,
-            None =>
-            {
-                error_msg.set("钱包未解锁".into());
-                return;
+        // 解析金额
+        let stored_max = max_amount_units();
+        let amount_units = if let Some(max_units) = stored_max {
+            max_units
+        } else {
+            match token {
+                TokenType::Native => match parse_token_amount_to_units(&amount_input, 18) {
+                    Ok(v) => v,
+                    Err(e) => { error_msg.set(e); return; }
+                },
+                TokenType::USDC | TokenType::USDT => {
+                    let decimals = token.decimals(&chain);
+                    match parse_token_amount_to_units(&amount_input, decimals) {
+                        Ok(v) => v,
+                        Err(e) => { error_msg.set(e); return; }
+                    }
+                }
             }
         };
 
-        let stored_max = max_amount_units(); // 获取存储的精确最大金额
+        if amount_units == 0 {
+            error_msg.set("金额必须大于零".into());
+            return;
+        }
+
+        // 检查私钥
+        if UNLOCKED_SK.read().is_none() {
+            // 暂存操作，跳到解锁页面
+            *PENDING_OP.write() = PendingOp::Send {
+                recipient: to_addr,
+                amount_units,
+                token: token.clone(),
+                gas_percent,
+                chain,
+            };
+            let mut stack = page_stack;
+            let mut p = page;
+            stack.write().push(p());
+            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                p.set(Page::Login(wid.clone()));
+            } else {
+                error_msg.set("未找到钱包".into());
+            }
+            return;
+        }
+
+        let sk_hex = UNLOCKED_SK.read().clone().unwrap();
+        let from_addr = address_for_send.clone();
 
         sending.set(true);
         error_msg.set(String::new());
         success_msg.set(String::new());
 
         spawn(async move {
-            // 解析金额为最小单位（纯整数，不经过浮点数）
-            // 如果有存储的最大金额且输入框的值与格式化后的最大金额相近，则使用精确值
-            let amount_units = if let Some(max_units) = stored_max {
-                // 使用存储的精确最大金额
-                max_units
-            } else {
-                // 正常解析用户输入
-                match token {
-                    TokenType::Native => {
-                        // 原生代币：18 位小数
-                        match parse_token_amount_to_units(&amount_input, 18) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                error_msg.set(e);
-                                sending.set(false);
-                                return;
-                            }
-                        }
-                    }
-                    TokenType::USDC | TokenType::USDT => {
-                        // ERC20 代币：根据链动态获取精度（BSC 为 18 位，其他链为 6 位）
-                        let decimals = token.decimals(&chain);
-                        match parse_token_amount_to_units(&amount_input, decimals) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                error_msg.set(e);
-                                sending.set(false);
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
-
-            if amount_units == 0 {
-                error_msg.set("金额必须大于零".into());
-                sending.set(false);
-                return;
-            }
-
             let result = match token {
                 TokenType::Native => {
-                    // 发送原生代币
                     send_native_transaction_units(&from_addr, &to_addr, amount_units, &sk_hex, &chain, gas_percent).await
                 }
                 TokenType::USDC | TokenType::USDT => {
-                    // 发送 ERC20 代币
                     let contract_addr = match token.contract_address(&chain) {
                         Some(addr) => addr,
                         None => {
                             error_msg.set(format!("该链不支持 {}", token.symbol(&chain)));
                             sending.set(false);
+                            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
                             return;
                         }
                     };
@@ -1513,19 +2058,106 @@ fn SendPage(page: Signal<Page>) -> Element
             };
 
             match result {
-                Ok(tx_hash) =>
-                {
-                    success_msg.set(format!("交易已发送！\n交易哈希: {}", tx_hash));
-                    recipient.set(String::new());
+                Ok(tx_hash) => {
+                    success_msg.set(format!("交易已发送！交易哈希: {}", tx_hash));
                     amount_str.set(String::new());
+                    max_amount_units.set(None);
                 }
-                Err(e) =>
-                {
+                Err(e) => {
                     error_msg.set(format!("发送失败: {}", e));
                 }
             }
             sending.set(false);
+            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
         });
+    };
+
+    // 当解锁完成后自动执行暂存的操作
+    use_effect(move || {
+        let op = PENDING_OP.read().clone();
+        match op {
+            PendingOp::Send { recipient, amount_units, token, gas_percent, chain } => {
+                if let Some(sk_hex) = UNLOCKED_SK.read().clone() {
+                    *PENDING_OP.write() = PendingOp::None;
+                    let from_addr = address.clone();
+                    sending.set(true);
+                    error_msg.set(String::new());
+                    success_msg.set(String::new());
+                    spawn(async move {
+                        let result = match token {
+                            TokenType::Native => {
+                                send_native_transaction_units(&from_addr, &recipient, amount_units, &sk_hex, &chain, gas_percent).await
+                            }
+                            TokenType::USDC | TokenType::USDT => {
+                                let contract_addr = match token.contract_address(&chain) {
+                                    Some(addr) => addr,
+                                    None => {
+                                        error_msg.set(format!("该链不支持 {}", token.symbol(&chain)));
+                                        sending.set(false);
+                                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                                        return;
+                                    }
+                                };
+                                send_erc20_transaction(&from_addr, &recipient, amount_units, &contract_addr, &sk_hex, &chain, gas_percent).await
+                            }
+                        };
+                        match result {
+                            Ok(tx_hash) => {
+                                success_msg.set(format!("交易已发送！交易哈希: {}", tx_hash));
+                                amount_str.set(String::new());
+                                max_amount_units.set(None);
+                            }
+                            Err(e) => {
+                                error_msg.set(format!("发送失败: {}", e));
+                            }
+                        }
+                        sending.set(false);
+                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
+    };
+
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
+    };
+
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
+            }
+        }
+    };
+
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
     };
 
     let chain = SELECTED_CHAIN.read().clone();
@@ -1536,11 +2168,15 @@ fn SendPage(page: Signal<Page>) -> Element
     let token_symbol_label = selected_token().symbol(&chain);
 
     rsx! {
-        div { class: "page send-page",
+        div {
+            class: "page send-page page-enter-right {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                    onclick: move |_| page.set(Page::Wallet),
+                        onclick: move |_| go_back(),
                     "← 返回"
                 }
                 span { class: "topbar-title", "📤 发送" }
@@ -1656,26 +2292,62 @@ fn SendPage(page: Signal<Page>) -> Element
 // ============ 接收页面 ============
 
 #[component]
-fn ReceivePage(page: Signal<Page>) -> Element
+fn ReceivePage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 {
-    let address = {
-        let sk = UNLOCKED_SK.read();
-        match sk.as_ref()
-        {
-            Some(sk_hex) => blockchain::account::private_key_hex_to_address(sk_hex)
-                .unwrap_or_else(|_| "地址计算错误".to_string()),
-            None => "未解锁".to_string(),
-        }
-    };
+    let address = get_current_wallet_address();
 
     let mut copied = use_signal(|| false);
 
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
+    };
+
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
+    };
+
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
+            }
+        }
+    };
+
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
+    };
+
     rsx! {
-        div { class: "page receive-page",
+        div {
+            class: "page receive-page page-enter-right {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                    onclick: move |_| page.set(Page::Wallet),
+                        onclick: move |_| go_back(),
                     "← 返回"
                 }
                 span { class: "topbar-title", "📥 接收" }
@@ -1783,20 +2455,12 @@ impl SwapToken
 }
 
 #[component]
-fn SwapPage(page: Signal<Page>) -> Element
+fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 {
     let chain = SELECTED_CHAIN.read().clone();
     let chain_supported = blockchain::swap::is_chain_supported(chain.chain_id);
 
-    let address = {
-        let sk = UNLOCKED_SK.read();
-        match sk.as_ref()
-        {
-            Some(sk_hex) => blockchain::account::private_key_hex_to_address(sk_hex)
-                .unwrap_or_else(|_| "地址计算错误".to_string()),
-            None => "未解锁".to_string(),
-        }
-    };
+    let address = get_current_wallet_address();
 
     let mut token_from = use_signal(|| SwapToken::Native);
     let mut token_to = use_signal(|| SwapToken::USDC);
@@ -1812,7 +2476,6 @@ fn SwapPage(page: Signal<Page>) -> Element
     let mut fetching_swap_balance = use_signal(|| false);
     let mut max_swap_amount_units: Signal<Option<u128>> = use_signal(|| None); // 存储精确的最小单位余额
 
-    let addr_for_swap = address.clone();
     let addr_for_max = address.clone();
 
     // 点击"全部"按钮的处理函数（交换页面）
@@ -1847,7 +2510,7 @@ fn SwapPage(page: Signal<Page>) -> Element
             
             // 格式化为人类可读的字符串显示
             let decimals = token.decimals(&chain);
-            let display_str = format_units_to_decimal(balance_units, decimals);
+            let display_str = format_units_to_decimal(balance_units, decimals, None);
             amount_str.set(display_str);
             
             // 清除之前的报价
@@ -1967,13 +2630,13 @@ fn SwapPage(page: Signal<Page>) -> Element
     };
 
     // 执行交换
+    let address_for_swap = address.clone();
     let on_swap = move |_| {
         let amount_input = amount_str().trim().to_string();
         let from = token_from();
         let to = token_to();
         let chain = SELECTED_CHAIN.read().clone();
         let fee = fee_tier();
-        let my_addr = addr_for_swap.clone();
 
         if from == to
         {
@@ -1990,7 +2653,6 @@ fn SwapPage(page: Signal<Page>) -> Element
         // 根据代币类型解析金额（与 on_get_quote 保持一致，纯整数）
         let amount_in: u128 = match from {
             SwapToken::Native => {
-                // 原生代币：18 位小数
                 match parse_token_amount_to_units(&amount_input, 18) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2000,7 +2662,6 @@ fn SwapPage(page: Signal<Page>) -> Element
                 }
             }
             SwapToken::USDC | SwapToken::USDT => {
-                // ERC20 代币：根据链动态获取精度（BSC 为 18 位，其他链为 6 位）
                 let decimals = from.decimals(&chain);
                 match parse_token_amount_to_units(&amount_input, decimals) {
                     Ok(v) => v,
@@ -2039,7 +2700,6 @@ fn SwapPage(page: Signal<Page>) -> Element
         };
 
         // 计算最小输出（考虑滑点）- 使用纯整数运算
-        // amount_out_min = quoted_out * (1000 - slippage_times_10) / 1000
         let amount_out_min = quoted_out * (1000 - slippage_times_10 as u128) / 1000;
 
         let token_in_addr = match from.address(&chain)
@@ -2062,15 +2722,31 @@ fn SwapPage(page: Signal<Page>) -> Element
             }
         };
 
-        let sk_hex = match UNLOCKED_SK.read().clone()
-        {
-            Some(sk) => sk,
-            None =>
-            {
-                error_msg.set("钱包未解锁".into());
-                return;
+        // 检查私钥
+        if UNLOCKED_SK.read().is_none() {
+            *PENDING_OP.write() = PendingOp::Swap {
+                token_in_addr,
+                token_out_addr,
+                amount_in,
+                amount_out_min,
+                fee,
+                recipient: address_for_swap.clone(),
+                chain_id: chain.chain_id,
+                rpc_url: chain.rpc_url.to_string(),
+            };
+            let mut stack = page_stack;
+            let mut p = page;
+            stack.write().push(p());
+            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                p.set(Page::Login(wid.clone()));
+            } else {
+                error_msg.set("未找到钱包".into());
             }
-        };
+            return;
+        }
+
+        let sk_hex = UNLOCKED_SK.read().clone().unwrap();
+        let my_addr = address_for_swap.clone();
 
         swapping.set(true);
         error_msg.set(String::new());
@@ -2103,7 +2779,92 @@ fn SwapPage(page: Signal<Page>) -> Element
                 }
             }
             swapping.set(false);
+            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
         });
+    };
+
+    // 当解锁完成后自动执行暂存的交换操作
+    use_effect(move || {
+        let op = PENDING_OP.read().clone();
+        match op {
+            PendingOp::Swap { token_in_addr, token_out_addr, amount_in, amount_out_min, fee, recipient, chain_id, rpc_url } => {
+                if let Some(sk_hex) = UNLOCKED_SK.read().clone() {
+                    *PENDING_OP.write() = PendingOp::None;
+                    swapping.set(true);
+                    error_msg.set(String::new());
+                    success_msg.set(String::new());
+                    let swap_params = blockchain::swap::SwapParams {
+                        token_in: token_in_addr,
+                        token_out: token_out_addr,
+                        amount_in,
+                        amount_out_min,
+                        fee,
+                        recipient,
+                        chain_id,
+                    };
+                    spawn(async move {
+                        let rpc = blockchain::rpc::RpcClient::new(&rpc_url);
+                        match blockchain::swap::execute_swap(&rpc, &swap_params, &sk_hex).await
+                        {
+                            Ok(tx_hash) =>
+                            {
+                                success_msg.set(format!("交换成功！交易哈希: {}", tx_hash));
+                                amount_str.set(String::new());
+                                quote_result.set(String::new());
+                                quote_amount_out.set(None);
+                            }
+                            Err(e) =>
+                            {
+                                error_msg.set(format!("交换失败: {}", e));
+                            }
+                        }
+                        swapping.set(false);
+                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
+    };
+
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
+    };
+
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
+            }
+        }
+    };
+
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
     };
 
     let native_symbol = chain.native_symbol.to_string();
@@ -2112,11 +2873,15 @@ fn SwapPage(page: Signal<Page>) -> Element
     let from_symbol = token_from().symbol(&chain);
 
     rsx! {
-        div { class: "page swap-page",
+        div {
+            class: "page swap-page page-enter-right {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                    onclick: move |_| page.set(Page::Wallet),
+                        onclick: move |_| go_back(),
                     "← 返回"
                 }
                 span { class: "topbar-title", "🔄 交换" }
@@ -2319,60 +3084,6 @@ fn SwapPage(page: Signal<Page>) -> Element
     }
 }
 
-// ============ 链选择模态窗口 ============
-
-#[component]
-fn ChainSelectorModal(on_close: EventHandler<()>, on_select: EventHandler<ChainInfo>) -> Element
-{
-    let chains = all_chains();
-    let current_chain_id = SELECTED_CHAIN.read().chain_id;
-
-    rsx! {
-        div {
-            class: "modal-overlay",
-            onclick: move |_| on_close.call(()),
-
-            div {
-                class: "modal-content",
-                onclick: move |e: Event<MouseData>| e.stop_propagation(),
-
-                h2 { class: "modal-title", "🔗 选择网络" }
-                p { class: "modal-subtitle", "选择要使用的区块链网络" }
-
-                div { class: "chain-list",
-                    for chain in chains {
-                        {
-                            let is_active = chain.chain_id == current_chain_id;
-                            let chain_for_click = chain.clone();
-                            rsx! {
-                                button {
-                                    class: if is_active { "chain-item active" } else { "chain-item" },
-                                    onclick: move |_| on_select.call(chain_for_click.clone()),
-                                    span { class: "chain-item-icon", "{chain.chain_icon}" }
-                                    div { class: "chain-item-info",
-                                        span { class: "chain-item-name", "{chain.name}" }
-                                        span { class: "chain-item-detail", "{chain.native_symbol} · Chain ID: {chain.chain_id}" }
-                                    }
-                                    if is_active {
-                                        span { class: "chain-item-check", "✓" }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                button {
-                    class: "btn btn-secondary",
-                    style: "margin-top: 12px;",
-                    onclick: move |_| on_close.call(()),
-                    "关闭"
-                }
-            }
-        }
-    }
-}
-
 // ============ 钱包详情模态窗口 ============
 
 #[component]
@@ -2400,8 +3111,6 @@ fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element
                         span { class: "wallet-detail-value wallet-detail-mono", "{wallet.address}" }
                     }
 
-                    div { class: "wallet-detail-divider" }
-
                     // 公钥
                     if has_pubkey {
                         div { class: "wallet-detail-row",
@@ -2416,22 +3125,20 @@ fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element
                     if !has_pubkey {
                         div { class: "wallet-detail-row",
                             span { class: "wallet-detail-label", "公钥" }
-                            span { class: "wallet-detail-value", style: "color: #888;", "（重新解锁钱包后自动填充）" }
+                            span { class: "wallet-detail-value", style: "color: #999;", "（重新解锁钱包后自动填充）" }
                         }
                     }
-
-                    div { class: "wallet-detail-divider" }
 
                     // 创建时间
                     div { class: "wallet-detail-row",
                         span { class: "wallet-detail-label", "创建时间" }
-                        span { class: "wallet-detail-value", "{created_time}" }
+                        span { class: "wallet-detail-value wallet-detail-mono", "{created_time}" }
                     }
 
                     // 钱包 ID
                     div { class: "wallet-detail-row",
                         span { class: "wallet-detail-label", "钱包 ID" }
-                        span { class: "wallet-detail-value wallet-detail-mono", style: "font-size: 11px; color: #666;", "{wallet.id}" }
+                        span { class: "wallet-detail-value wallet-detail-mono", "{wallet.id}" }
                     }
                 }
 
@@ -2449,59 +3156,261 @@ fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element
 // ============ 交易记录组件 ============
 
 #[component]
-fn TxItem(tx: TxRecord, my_address: String) -> Element
+fn TxItem(tx: TxRecord, my_address: String, page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 {
-    let mut show_detail = use_signal(|| false);
-
-    let direction_icon = if tx.is_outgoing { "📤" } else { "📥" };
-    let direction_class = if tx.is_outgoing { "tx-out" } else { "tx-in" };
-    let status_icon = if tx.is_error { "❌" } else { "✅" };
-    let counterparty = if tx.is_outgoing
-    {
-        shorten_address(&tx.to)
-    }
-    else
-    {
-        shorten_address(&tx.from)
-    };
-    let direction_label = if tx.is_outgoing { "发送至" } else { "接收自" };
-    let short_hash = shorten_hash(&tx.hash);
-    let tx_for_modal = tx.clone();
+    let is_out = tx.from.to_lowercase() == my_address.to_lowercase();
+    let dir = if is_out { "↑" } else { "↓" };
+    let status = if tx.is_error { "❌" } else { "✅" };
+    let cp = if is_out { shorten_address(&tx.to) } else { shorten_address(&tx.from) };
+    let symbol = SELECTED_CHAIN.read().native_symbol.to_string();
+    let tx_for_detail = tx.clone();
 
     rsx! {
         div {
-            class: "tx-item tx-item-clickable {direction_class}",
-            onclick: move |_| show_detail.set(true),
-            div { class: "tx-icon", "{direction_icon}" }
-            div { class: "tx-details",
-                div { class: "tx-main",
-                    span { class: "tx-direction", "{direction_label} " }
-                    span { class: "tx-counterparty", title: if tx.is_outgoing { "{tx.to}" } else { "{tx.from}" }, "{counterparty}" }
-                }
-                div { class: "tx-sub",
-                    span { class: "tx-hash", "Tx: {short_hash}" }
-                    span { class: "tx-time", "{tx.timestamp}" }
-                }
+            class: "asset-tx-item",
+            onclick: move |_| {
+                let mut stack = page_stack;
+                let mut p = page;
+                stack.write().push(p());
+                p.set(Page::TransactionDetail(tx_for_detail.clone()));
+            },
+            div { class: "asset-tx-left",
+                span { class: "asset-tx-dir", "{dir}" }
+                span { class: "asset-tx-addr", "{cp}" }
             }
-            div { class: "tx-amount",
-                span { class: "tx-value", "{tx.value_eth} {SELECTED_CHAIN.read().native_symbol}" }
-                span { class: "tx-status", "{status_icon}" }
+            div { class: "asset-tx-right",
+                span { class: "asset-tx-value", "{tx.value_eth} {symbol}" }
+                span { class: "asset-tx-status", "{status}" }
+            }
+            div { class: "asset-tx-time", "{tx.timestamp}" }
+        }
+    }
+}
+
+// ============ 资产详情页面 ============
+
+#[component]
+fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: u64, chain_name: String, token: TokenType, symbol: String) -> Element
+{
+    let mut balance_str = use_signal(|| "加载中...".to_string());
+    let mut transactions: Signal<Vec<TxRecord>> = use_signal(Vec::new);
+    let mut tx_loading = use_signal(|| false);
+    let mut tx_error = use_signal(|| String::new());
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+    let mut refresh_counter = use_signal(|| 0u32);
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
+    };
+
+    // 获取精确余额
+    {
+        let token = token.clone();
+        let chain_id_copy = chain_id;
+        let _chain_name = chain_name.clone();
+        use_effect(move || {
+            let _ = refresh_counter();
+            let cache_key = balance_key(chain_id_copy, &token);
+            if let Some(cached) = BALANCE_CACHE.read().get(&cache_key) {
+                match cached {
+                    Ok(bal) => balance_str.set(bal.clone()),
+                    Err(e) => balance_str.set(format!("错误: {}", e)),
+                }
+                return;
+            }
+            let chains = all_chains();
+            if let Some(chain) = chains.iter().find(|c| c.chain_id == chain_id_copy) {
+                let addr = get_current_wallet_address();
+                let t = token.clone();
+                let c = chain.clone();
+                balance_str.set("加载中...".to_string());
+                spawn(async move {
+                    match fetch_token_balance_units(&addr, &t, &c).await {
+                        Ok(units) => {
+                            let decimals = t.decimals(&c);
+                            let formatted = format_units_to_decimal(units, decimals, None);
+                            BALANCE_CACHE.write().insert(cache_key, Ok(formatted.clone()));
+                            balance_str.set(formatted);
+                        }
+                        Err(e) => {
+                            BALANCE_CACHE.write().insert(cache_key, Err(e.clone()));
+                            balance_str.set(format!("错误: {}", e));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    // 获取交易记录
+    {
+        let chain_id_copy = chain_id;
+        use_effect(move || {
+            let _ = refresh_counter();
+            let chains = all_chains();
+            if let Some(chain) = chains.iter().find(|c| c.chain_id == chain_id_copy) {
+                let addr = get_current_wallet_address();
+                let c = chain.clone();
+
+                if let Some(cached) = TX_CACHE.read().get(&chain_id_copy) {
+                    match cached {
+                        Ok(txs) => { tx_error.set(String::new()); transactions.set(txs.clone()); tx_loading.set(false); }
+                        Err(e) => { transactions.set(Vec::new()); tx_error.set(format!("获取交易历史失败: {}", e)); tx_loading.set(false); }
+                    }
+                    return;
+                }
+
+                tx_loading.set(true);
+                tx_error.set(String::new());
+                spawn(async move {
+                    match fetch_transactions(&addr, &c).await {
+                        Ok(txs) => {
+                            TX_CACHE.write().insert(chain_id_copy, Ok(txs.clone()));
+                            tx_error.set(String::new());
+                            transactions.set(txs);
+                        }
+                        Err(e) => {
+                            TX_CACHE.write().insert(chain_id_copy, Err(e.clone()));
+                            transactions.set(Vec::new());
+                            tx_error.set(format!("获取交易历史失败: {}", e));
+                        }
+                    }
+                    tx_loading.set(false);
+                });
+            }
+        });
+    }
+
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
+    };
+
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
             }
         }
+    };
 
-        if show_detail() {
-            TxDetailModal {
-                tx: tx_for_modal.clone(),
-                on_close: move || show_detail.set(false),
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
+    };
+
+    let title = format!("{} ({})", symbol, chain_name);
+
+    rsx! {
+        div {
+            class: "page page-enter-right {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
+            div { class: "topbar",
+                button {
+                    class: "btn btn-small btn-secondary",
+                    onclick: move |_| go_back(),
+                    "← 返回"
+                }
+                span { class: "topbar-title", "{title}" }
+                span {}
+            }
+
+            div { class: "card", style: "text-align: center;",
+                h2 { class: "section-title", style: "text-align: center;", "余额" }
+                p { class: "asset-detail-balance", "{balance_str} {symbol}" }
+            }
+
+            div { class: "card",
+                div { class: "tx-header",
+                    h2 { class: "section-title", "交易记录" }
+                    button {
+                        class: "btn btn-small btn-secondary",
+                        onclick: move |_| {
+                            BALANCE_CACHE.write().remove(&balance_key(chain_id, &token));
+                            TX_CACHE.write().remove(&chain_id);
+                            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+                                save_wallet_cache(wid);
+                            }
+                            refresh_counter.set(refresh_counter() + 1);
+                        },
+                        "刷新"
+                    }
+                }
+
+                if tx_loading() {
+                    p { class: "loading-text", "加载交易历史中..." }
+                }
+                if !tx_error().is_empty() {
+                    p { class: "error", "{tx_error}" }
+                }
+                if transactions().is_empty() && !tx_loading() && tx_error().is_empty() {
+                    p { class: "empty-text", "暂无交易记录" }
+                }
+
+                for tx_rec in transactions() {
+                    {
+                        let tx_clone = tx_rec.clone();
+                        let my_addr = get_current_wallet_address();
+                        let is_out = tx_clone.from.to_lowercase() == my_addr.to_lowercase();
+                        let dir = if is_out { "↑" } else { "↓" };
+                        let status = if tx_clone.is_error { "❌" } else { "✅" };
+                        let cp = if is_out { shorten_address(&tx_clone.to) } else { shorten_address(&tx_clone.from) };
+                        rsx! {
+                            div {
+                                class: "asset-tx-item",
+                                onclick: {
+                                    let tx_c = tx_clone.clone();
+                                    let mut stack = page_stack;
+                                    let mut p = page;
+                                    let push_page = Page::AssetDetail {
+                                        chain_id, chain_name: chain_name.clone(),
+                                        token: token.clone(), symbol: symbol.clone(),
+                                    };
+                                    move |_| {
+                                        stack.write().push(push_page.clone());
+                                        p.set(Page::TransactionDetail(tx_c.clone()));
+                                    }
+                                },
+                                div { class: "asset-tx-left",
+                                    span { class: "asset-tx-dir", "{dir}" }
+                                    span { class: "asset-tx-addr", "{cp}" }
+                                }
+                                div { class: "asset-tx-right",
+                                    span { class: "asset-tx-value", "{tx_rec.value_eth} {symbol}" }
+                                    span { class: "asset-tx-status", "{status}" }
+                                }
+                                div { class: "asset-tx-time", "{tx_rec.timestamp}" }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-// ============ 交易详情模态窗口 ============
+// ============ 交易详情页面 ============
 
 #[component]
-fn TxDetailModal(tx: TxRecord, on_close: EventHandler<()>) -> Element
+fn TransactionDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, tx: TxRecord) -> Element
 {
     let chain = SELECTED_CHAIN.read().clone();
     let explorer_tx_url = format!("{}/tx/{}", chain.explorer_url, tx.hash);
@@ -2509,98 +3418,114 @@ fn TxDetailModal(tx: TxRecord, on_close: EventHandler<()>) -> Element
     let direction_text = if tx.is_outgoing { "📤 发送" } else { "📥 接收" };
     let explorer_url_clone = explorer_tx_url.clone();
 
+    let mut leave_anim = use_signal(|| String::new());
+    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
+
+    let go_back = move || {
+        let mut stack = page_stack;
+        let mut p = page;
+        if let Some(prev) = stack.write().pop() {
+            p.set(prev);
+        }
+    };
+
+    let on_touch_start = move |evt: Event<TouchData>| {
+        if let Some(touch) = evt.touches().first() {
+            let coords = touch.client_coordinates();
+            touch_start.set((coords.x, coords.y));
+        }
+    };
+
+    let on_touch_end = move |evt: Event<TouchData>| {
+        let (start_x, start_y) = touch_start();
+        if let Some(touch) = evt.touches_changed().first() {
+            let coords = touch.client_coordinates();
+            let dx = coords.x - start_x;
+            let dy = coords.y - start_y;
+            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
+                if dx > 0.0 {
+                    leave_anim.set("page-leave-right".into());
+                } else {
+                    leave_anim.set("page-leave-left".into());
+                }
+            }
+        }
+    };
+
+    let on_animation_end = move |_: Event<AnimationData>| {
+        if !leave_anim().is_empty() {
+            go_back();
+        }
+    };
+
     rsx! {
         div {
-            class: "modal-overlay",
-            onclick: move |_| on_close.call(()),
+            class: "page page-enter-right {leave_anim}",
+            ontouchstart: on_touch_start,
+            ontouchend: on_touch_end,
+            onanimationend: on_animation_end,
+            div { class: "topbar",
+                button {
+                    class: "btn btn-small btn-secondary",
+                    onclick: move |_| go_back(),
+                    "← 返回"
+                }
+                span { class: "topbar-title", "📋 交易详情" }
+                span {}
+            }
 
-            div {
-                class: "modal-content tx-detail-modal",
-                onclick: move |e: Event<MouseData>| e.stop_propagation(),
-
-                h2 { class: "modal-title", "📋 交易详情" }
-
+            div { class: "card",
                 div { class: "tx-detail-list",
-                    // 状态
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "状态" }
                         span { class: "tx-detail-value", "{status_text}" }
                     }
-
-                    // 方向
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "类型" }
                         span { class: "tx-detail-value", "{direction_text}" }
                     }
-
-                    // 金额
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "金额" }
                         span { class: "tx-detail-value", "{tx.value_eth} {chain.native_symbol}" }
                     }
-
-                    // Wei 值
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "Wei" }
                         span { class: "tx-detail-value tx-detail-mono", "{tx.value_wei}" }
                     }
-
                     div { class: "tx-detail-divider" }
-
-                    // 发送方
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "发送方" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.from}" }
                     }
-
-                    // 接收方
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "接收方" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.to}" }
                     }
-
                     div { class: "tx-detail-divider" }
-
-                    // 交易哈希
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "交易哈希" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.hash}" }
                     }
-
-                    // 区块号
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "区块号" }
                         span { class: "tx-detail-value", "{tx.block_number}" }
                     }
-
-                    // Gas 使用量
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "Gas 用量" }
                         span { class: "tx-detail-value", "{tx.gas_used}" }
                     }
-
-                    // 时间
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "时间" }
                         span { class: "tx-detail-value", "{tx.timestamp}" }
                     }
                 }
-                // 在区块浏览器中查看按钮
                 button {
                     class: "btn btn-primary",
                     style: "margin-top: 16px;",
                     r#type: "button",
                     onclick: move |_| {},
-                    // 使用内联 JavaScript 打开外部浏览器（WebView 支持）
                     "onmousedown": format!("window.open('{}', '_system');", explorer_url_clone),
                     "🔗 在区块浏览器中查看"
-                }
-
-                button {
-                    class: "btn btn-secondary",
-                    style: "margin-top: 8px;",
-                    onclick: move |_| on_close.call(()),
-                    "关闭"
                 }
             }
         }
@@ -2614,12 +3539,37 @@ static CURRENT_WALLET_ID: dioxus::prelude::GlobalSignal<Option<String>> = Global
 static ETHERSCAN_KEY: dioxus::prelude::GlobalSignal<String> = GlobalSignal::new(|| load_api_key());
 static SELECTED_CHAIN: dioxus::prelude::GlobalSignal<ChainInfo> = GlobalSignal::new(|| default_chain());
 
+// 缓存：每条链每个代币的余额（首次获取后存入，后续直接展示缓存）
+static BALANCE_CACHE: dioxus::prelude::GlobalSignal<HashMap<String, Result<String, String>>> =
+    GlobalSignal::new(|| HashMap::new());
+// 缓存：每条链的交易记录（首次获取后存入，后续直接展示缓存）
+static TX_CACHE: dioxus::prelude::GlobalSignal<HashMap<u64, Result<Vec<TxRecord>, String>>> =
+    GlobalSignal::new(|| HashMap::new());
+
+/// 待执行的操作（签名后自动执行）
+static PENDING_OP: dioxus::prelude::GlobalSignal<PendingOp> = GlobalSignal::new(|| PendingOp::None);
+
+/// 正在执行中的余额查询 key（用于去重，防止重复 spawn）
+static IN_FLIGHT: dioxus::prelude::GlobalSignal<HashSet<String>> = GlobalSignal::new(|| HashSet::new());
+
+/// 持久化缓存结构（序列化到 files/cache/<wallet_id>.json）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalletCache {
+    balances: HashMap<String, Result<String, String>>,
+    transactions: HashMap<u64, Result<Vec<TxRecord>, String>>,
+}
+
+/// 生成余额缓存 key: "chain_id_TokenType"，如 "1_Native"
+fn balance_key(chain_id: u64, token: &TokenType) -> String {
+    format!("{}_{:?}", chain_id, token)
+}
+
 // ============ 辅助函数 ============
 
 // ============ 钱包列表管理 ============
 
-/// 获取数据根目录（Android 数据目录）
-fn get_data_dir() -> Option<std::path::PathBuf>
+/// 获取 Android 应用根目录 /data/data/<package>/
+fn get_app_dir() -> Option<std::path::PathBuf>
 {
     let cmdline = std::fs::read("/proc/self/cmdline").ok()?;
     let package_name = String::from_utf8_lossy(&cmdline)
@@ -2629,11 +3579,18 @@ fn get_data_dir() -> Option<std::path::PathBuf>
         return None;
     }
     let path = std::path::PathBuf::from(format!("/data/data/{}", package_name));
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    let _ = std::fs::create_dir_all(&path);
+    Some(path)
+}
+
+/// 获取数据根目录（Android files 目录）
+fn get_data_dir() -> Option<std::path::PathBuf>
+{
+    get_app_dir().map(|p| {
+        let files = p.join("files");
+        let _ = std::fs::create_dir_all(&files);
+        files
+    })
 }
 
 /// 获取钱包 keystore 文件的完整路径: <exe_dir>/wallets/<id>
@@ -2651,6 +3608,48 @@ fn get_wallet_list_path() -> std::path::PathBuf
     // 确保 wallets 目录存在
     let _ = std::fs::create_dir_all(&wallets_dir);
     wallets_dir.join(WALLET_LIST_FILE)
+}
+
+/// 获取缓存目录 files/cache/
+fn get_cache_dir() -> std::path::PathBuf
+{
+    let dir = get_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let cache_dir = dir.join("cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    cache_dir
+}
+
+/// 获取指定钱包的缓存文件路径
+fn get_cache_path(wallet_id: &str) -> std::path::PathBuf
+{
+    get_cache_dir().join(format!("{}.json", wallet_id))
+}
+
+/// 从文件加载钱包缓存
+fn load_wallet_cache(wallet_id: &str) -> Option<WalletCache>
+{
+    let path = get_cache_path(wallet_id);
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(cache) = serde_json::from_str(&data) {
+                return Some(cache);
+            }
+        }
+    }
+    None
+}
+
+/// 将当前内存缓存保存到文件
+fn save_wallet_cache(wallet_id: &str)
+{
+    let cache = WalletCache {
+        balances: BALANCE_CACHE.read().clone(),
+        transactions: TX_CACHE.read().clone(),
+    };
+    let path = get_cache_path(wallet_id);
+    if let Ok(json) = serde_json::to_string_pretty(&cache) {
+        let _ = std::fs::write(&path, json);
+    }
 }
 
 /// 读取钱包列表；文件不存在则返回空列表
@@ -2712,7 +3711,7 @@ fn current_unix_timestamp() -> u64
 
 fn load_api_key() -> String
 {
-    if let Some(dir) = get_data_dir()
+    if let Some(dir) = get_app_dir()
     {
         let api_dir = dir.join("api");
         if let Ok(key) = std::fs::read_to_string(api_dir.join(API_KEY_FILE))
@@ -2729,13 +3728,25 @@ fn load_api_key() -> String
 
 fn save_api_key(key: &str)
 {
-    if let Some(dir) = get_data_dir()
+    if let Some(dir) = get_app_dir()
     {
         let api_dir = dir.join("api");
         // 确保 api 目录存在
         let _ = std::fs::create_dir_all(&api_dir);
         let _ = std::fs::write(api_dir.join(API_KEY_FILE), key.trim());
     }
+}
+
+/// 获取当前钱包的地址（从钱包列表读取，不依赖私钥）
+fn get_current_wallet_address() -> String
+{
+    if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
+        let list = load_wallet_list();
+        if let Some(w) = list.wallets.iter().find(|w| w.id == *wid) {
+            return w.address.clone();
+        }
+    }
+    "未找到钱包".to_string()
 }
 
 fn shorten_address(addr: &str) -> String
@@ -2747,18 +3758,6 @@ fn shorten_address(addr: &str) -> String
     else
     {
         addr.to_string()
-    }
-}
-
-fn shorten_hash(hash: &str) -> String
-{
-    if hash.len() > 16
-    {
-        format!("{}...{}", &hash[..10], &hash[hash.len() - 6..])
-    }
-    else
-    {
-        hash.to_string()
     }
 }
 
@@ -2871,8 +3870,8 @@ async fn fetch_token_balance(address: &str, token: &TokenType, chain: &ChainInfo
             }
             else
             {
-                // 格式化为人类可读的字符串（18 位小数）
-                let display_str = format_units_to_decimal(balance_wei, 18);
+                // 格式化为人类可读的字符串（最多 8 位小数，截断不四舍五入）
+                let display_str = format_units_to_decimal(balance_wei, 18, None);
                 Ok(display_str)
             }
         }
@@ -2932,7 +3931,8 @@ async fn fetch_token_balance_units(address: &str, token: &TokenType, chain: &Cha
 }
 
 /// 将最小单位金额格式化为人类可读的十进制字符串
-fn format_units_to_decimal(units: u128, decimals: u8) -> String
+/// max_decimals: 最多显示几位小数（直接截断不四舍五入），None 表示不限制
+fn format_units_to_decimal(units: u128, decimals: u8, max_decimals: Option<usize>) -> String
 {
     let divisor = 10u128.pow(decimals as u32);
     let whole = units / divisor;
@@ -2943,9 +3943,31 @@ fn format_units_to_decimal(units: u128, decimals: u8) -> String
     } else {
         // 格式化小数部分，去除尾部的零
         let frac_str = format!("{:0>width$}", frac, width = decimals as usize);
-        let trimmed = frac_str.trim_end_matches('0');
-        format!("{}.{}", whole, trimmed)
+        let mut trimmed: String = frac_str.trim_end_matches('0').to_string();
+        if let Some(max) = max_decimals {
+            if trimmed.len() > max {
+                trimmed.truncate(max);
+            }
+        }
+        if trimmed.is_empty() {
+            format!("{}", whole)
+        } else {
+            format!("{}.{}", whole, trimmed)
+        }
     }
+}
+
+/// 将全精度余额字符串截断到 8 位小数（仅用于主页展示）
+fn truncate_balance_for_display(bal: &str) -> String
+{
+    if let Some(dot_pos) = bal.find('.') {
+        let int_part = &bal[..dot_pos];
+        let frac_part = &bal[dot_pos + 1..];
+        if frac_part.len() > 8 {
+            return format!("{}.{}", int_part, &frac_part[..8]);
+        }
+    }
+    bal.to_string()
 }
 
 async fn fetch_transactions(address: &str, chain: &ChainInfo) -> Result<Vec<TxRecord>, String>
@@ -3132,12 +4154,13 @@ const CSS: &str = r#"
     margin: 0;
     padding: 0;
     box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
 }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    background: #0f0f1a;
-    color: #e0e0e0;
+    background: #f5f5f5;
+    color: #333;
     min-height: 100vh;
 }
 
@@ -3147,6 +4170,7 @@ body {
     display: flex;
     flex-direction: column;
     align-items: center;
+    overflow: hidden;
 }
 
 .page {
@@ -3154,6 +4178,7 @@ body {
     max-width: 100%;
     margin: 0 auto;
     padding: 16px;
+    padding-top: 36px;
     min-height: 100vh;
 }
 
@@ -3163,12 +4188,16 @@ body {
     justify-content: center;
 }
 
+.wallet-page {
+    padding-bottom: 70px;
+}
+
 .card {
-    background: #1a1a2e;
+    background: #ffffff;
     border-radius: 16px;
     padding: 20px;
     margin-bottom: 16px;
-    border: 1px solid #2a2a4a;
+    border: 1px solid #e0e0e0;
     width: 100%;
 }
 
@@ -3184,7 +4213,7 @@ body {
 
 .subtitle {
     text-align: center;
-    color: #888;
+    color: #999;
     margin-bottom: 24px;
     font-size: 14px;
 }
@@ -3196,7 +4225,7 @@ body {
 .form-group label {
     display: block;
     font-size: 13px;
-    color: #aaa;
+    color: #999;
     margin-bottom: 6px;
     font-weight: 500;
 }
@@ -3214,8 +4243,8 @@ body {
 
 .btn-max {
     padding: 6px 16px;
-    background: #1a1a2e;
-    border: 1px solid #333;
+    background: #ffffff;
+    border: 1px solid #ddd;
     border-radius: 8px;
     color: #667eea;
     font-size: 13px;
@@ -3237,10 +4266,10 @@ body {
 .form-group input {
     width: 100%;
     padding: 12px 16px;
-    background: #0f0f1a;
-    border: 1px solid #333;
+    background: #f5f5f5;
+    border: 1px solid #ddd;
     border-radius: 10px;
-    color: #e0e0e0;
+    color: #333;
     font-size: 14px;
     outline: none;
     transition: border-color 0.2s;
@@ -3251,7 +4280,7 @@ body {
 }
 
 .form-group input::placeholder {
-    color: #555;
+    color: #bbb;
 }
 
 .gas-fee-buttons {
@@ -3263,10 +4292,10 @@ body {
 .gas-fee-btn {
     flex: 1;
     padding: 10px 16px;
-    background: #1a1a2e;
-    border: 1px solid #333;
+    background: #ffffff;
+    border: 1px solid #ddd;
     border-radius: 8px;
-    color: #aaa;
+    color: #999;
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
@@ -3275,7 +4304,7 @@ body {
 
 .gas-fee-btn:hover {
     border-color: #667eea;
-    color: #e0e0e0;
+    color: #333;
 }
 
 .gas-fee-btn.active {
@@ -3287,7 +4316,7 @@ body {
 
 .gas-fee-hint {
     font-size: 12px;
-    color: #777;
+    color: #999;
     margin-top: 8px;
     line-height: 1.4;
 }
@@ -3372,7 +4401,7 @@ body {
 
 .divider {
     height: 1px;
-    background: #2a2a4a;
+    background: #e0e0e0;
     margin: 16px 0;
 }
 
@@ -3406,9 +4435,9 @@ body {
     gap: 6px;
     padding: 10px 8px;
     border-radius: 10px;
-    border: 1px solid #2a2a4a;
-    background: #1a1a2e;
-    color: #888;
+    border: 1px solid #e0e0e0;
+    background: #ffffff;
+    color: #999;
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
@@ -3417,13 +4446,13 @@ body {
 
 .token-tab:hover {
     border-color: #667eea;
-    color: #ccc;
+    color: #555;
 }
 
 .token-tab.active {
     border-color: #667eea;
     background: rgba(102, 126, 234, 0.12);
-    color: #fff;
+    color: #222;
 }
 
 .token-tab-icon {
@@ -3434,6 +4463,17 @@ body {
     text-align: center;
 }
 
+.account-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.account-header .section-title {
+    margin-bottom: 0;
+}
+
 .account-address {
     margin-bottom: 16px;
 }
@@ -3441,14 +4481,14 @@ body {
 .account-address .label {
     display: block;
     font-size: 12px;
-    color: #888;
+    color: #999;
     margin-bottom: 4px;
 }
 
 .account-address .address {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 14px;
-    color: #aaa;
+    color: #999;
     cursor: default;
 }
 
@@ -3459,13 +4499,13 @@ body {
 .balance-value {
     font-size: 36px;
     font-weight: 700;
-    color: #fff;
+    color: #222;
     margin-right: 8px;
 }
 
 .balance-unit {
     font-size: 18px;
-    color: #888;
+    color: #999;
 }
 
 .action-buttons {
@@ -3478,15 +4518,26 @@ body {
     overflow-y: auto;
 }
 
+.tx-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.tx-header .section-title {
+    margin-bottom: 0;
+}
+
 .section-title {
     font-size: 16px;
     font-weight: 600;
     margin-bottom: 12px;
-    color: #ccc;
+    color: #555;
 }
 
 .loading-text, .empty-text {
-    color: #666;
+    color: #999;
     text-align: center;
     padding: 20px;
     font-size: 14px;
@@ -3496,120 +4547,6 @@ body {
     display: flex;
     flex-direction: column;
     gap: 4px;
-}
-
-.tx-item {
-    display: flex;
-    align-items: center;
-    padding: 12px;
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.02);
-    transition: background 0.2s;
-    gap: 12px;
-}
-
-.tx-item:hover {
-    background: rgba(255, 255, 255, 0.05);
-}
-
-.tx-icon {
-    font-size: 20px;
-    width: 36px;
-    height: 36px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-    flex-shrink: 0;
-}
-
-.tx-out .tx-icon { background: rgba(255, 107, 107, 0.15); }
-.tx-in .tx-icon { background: rgba(107, 255, 107, 0.15); }
-
-.tx-details {
-    flex: 1;
-    min-width: 0;
-}
-
-.tx-main {
-    font-size: 14px;
-    margin-bottom: 2px;
-}
-
-.tx-direction {
-    color: #aaa;
-}
-
-.tx-counterparty {
-    font-family: "SF Mono", "Fira Code", monospace;
-    font-size: 12px;
-    color: #ccc;
-}
-
-.tx-sub {
-    font-size: 11px;
-    color: #666;
-    display: flex;
-    gap: 8px;
-}
-
-.tx-hash {
-    font-family: "SF Mono", "Fira Code", monospace;
-}
-
-.tx-amount {
-    text-align: right;
-    flex-shrink: 0;
-}
-
-.tx-value {
-    display: block;
-    font-size: 14px;
-    font-weight: 600;
-    color: #fff;
-}
-
-.tx-out .tx-value { color: #ff6b6b; }
-.tx-in .tx-value { color: #6bff6b; }
-
-.tx-status {
-    font-size: 11px;
-}
-
-.future-card {
-    opacity: 0.6;
-}
-
-.future-features {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-
-.feature-tag {
-    padding: 6px 12px;
-    background: rgba(102, 126, 234, 0.08);
-    border: 1px solid rgba(102, 126, 234, 0.15);
-    border-radius: 20px;
-    font-size: 12px;
-    color: #888;
-}
-
-::-webkit-scrollbar {
-    width: 6px;
-}
-
-::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-    background: #333;
-    border-radius: 3px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: #444;
 }
 
 /* ======== 发送页面 ======== */
@@ -3641,7 +4578,7 @@ body {
 .tx-hash-display {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 11px;
-    color: #aaa;
+    color: #999;
     word-break: break-all;
     margin-top: 6px;
 }
@@ -3660,8 +4597,8 @@ body {
 /* ======== 接收页面 ======== */
 
 .address-display {
-    background: #0f0f1a;
-    border: 1px solid #333;
+    background: #f5f5f5;
+    border: 1px solid #ddd;
     border-radius: 10px;
     padding: 18px 16px;
     margin: 16px 0 0 0;
@@ -3672,7 +4609,7 @@ body {
 .full-address {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 15px;
-    color: #e0e0e0;
+    color: #333;
     letter-spacing: 0.5px;
     line-height: 1.6;
 }
@@ -3694,9 +4631,9 @@ body {
     padding: 10px 16px;
     margin-bottom: 10px;
     border-radius: 10px;
-    border: 1px solid #2a2a4a;
-    background: #1a1a2e;
-    color: #ccc;
+    border: 1px solid #e0e0e0;
+    background: #ffffff;
+    color: #555;
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
@@ -3722,6 +4659,27 @@ body {
     font-size: 12px;
 }
 
+.chain-selector-container {
+    position: relative;
+    margin-bottom: 10px;
+}
+
+.chain-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-top: none;
+    border-radius: 0 0 12px 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+    max-height: 360px;
+    overflow-y: auto;
+    animation: dropdown-expand 0.3s ease-out;
+}
+
 /* ======== 模态窗口 ======== */
 
 .modal-overlay {
@@ -3738,15 +4696,43 @@ body {
 }
 
 .modal-content {
-    background: #1a1a2e;
-    border: 1px solid #2a2a4a;
+    position: relative;
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
     border-radius: 16px;
     padding: 20px;
     width: 95%;
     max-width: 100%;
     max-height: 80vh;
     overflow-y: auto;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+.modal-close-btn {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+    border: 1.5px solid #d0d0d0;
+    border-radius: 8px;
+    color: #888;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+    line-height: 1;
+    padding: 0;
+}
+
+.modal-close-btn:hover {
+    background: #f5f5f5;
+    border-color: #999;
+    color: #333;
 }
 
 .modal-title {
@@ -3754,12 +4740,12 @@ body {
     font-weight: 700;
     text-align: center;
     margin-bottom: 4px;
-    color: #e0e0e0;
+    color: #333;
 }
 
 .modal-subtitle {
     text-align: center;
-    color: #888;
+    color: #999;
     font-size: 13px;
     margin-bottom: 16px;
 }
@@ -3778,8 +4764,8 @@ body {
     padding: 12px 14px;
     border-radius: 10px;
     border: 1px solid transparent;
-    background: rgba(255, 255, 255, 0.02);
-    color: #ccc;
+    background: rgba(0, 0, 0, 0.02);
+    color: #555;
     font-size: 14px;
     cursor: pointer;
     transition: all 0.2s;
@@ -3813,12 +4799,12 @@ body {
 .chain-item-name {
     font-weight: 600;
     font-size: 14px;
-    color: #e0e0e0;
+    color: #333;
 }
 
 .chain-item-detail {
     font-size: 11px;
-    color: #666;
+    color: #999;
     margin-top: 2px;
 }
 
@@ -3830,10 +4816,6 @@ body {
 }
 
 /* ======== 交易详情 ======== */
-
-.tx-item-clickable {
-    cursor: pointer;
-}
 
 .tx-detail-modal {
     max-width: 100%;
@@ -3849,7 +4831,7 @@ body {
     display: flex;
     flex-direction: column;
     padding: 10px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.04);
 }
 
 .tx-detail-row:last-child {
@@ -3858,7 +4840,7 @@ body {
 
 .tx-detail-label {
     font-size: 11px;
-    color: #888;
+    color: #999;
     margin-bottom: 4px;
     font-weight: 500;
     text-transform: uppercase;
@@ -3867,7 +4849,7 @@ body {
 
 .tx-detail-value {
     font-size: 14px;
-    color: #e0e0e0;
+    color: #333;
     line-height: 1.4;
 }
 
@@ -3878,12 +4860,12 @@ body {
 
 .tx-detail-address {
     word-break: break-all;
-    color: #ccc;
+    color: #555;
 }
 
 .tx-detail-divider {
     height: 1px;
-    background: #2a2a4a;
+    background: #e0e0e0;
     margin: 4px 0;
 }
 
@@ -3902,9 +4884,9 @@ body {
 }
 
 .wallet-list-item {
-    border: 1px solid #2a2a4a;
+    border: 1px solid #e0e0e0;
     border-radius: 12px;
-    background: rgba(255, 255, 255, 0.02);
+    background: rgba(0, 0, 0, 0.02);
     overflow: hidden;
     transition: all 0.2s;
 }
@@ -3938,7 +4920,7 @@ body {
     gap: 8px;
     font-size: 15px;
     font-weight: 600;
-    color: #e0e0e0;
+    color: #333;
     margin-bottom: 4px;
 }
 
@@ -3955,7 +4937,7 @@ body {
 .wallet-list-addr {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 12px;
-    color: #888;
+    color: #999;
 }
 
 .wallet-list-arrow {
@@ -3989,16 +4971,16 @@ body {
 .wallet-rename-input {
     flex: 1;
     padding: 6px 10px;
-    background: #0f0f1a;
+    background: #f5f5f5;
     border: 1px solid #667eea;
     border-radius: 6px;
-    color: #e0e0e0;
+    color: #333;
     font-size: 13px;
     outline: none;
 }
 
 .wallet-rename-input::placeholder {
-    color: #555;
+    color: #bbb;
 }
 
 /* ======== 钱包选择器（主页下拉） ======== */
@@ -4015,9 +4997,9 @@ body {
     width: 100%;
     padding: 10px 16px;
     border-radius: 10px;
-    border: 1px solid #2a2a4a;
-    background: #1a1a2e;
-    color: #ccc;
+    border: 1px solid #e0e0e0;
+    background: #ffffff;
+    color: #555;
     font-size: 14px;
     font-weight: 600;
     cursor: pointer;
@@ -4049,17 +5031,18 @@ body {
     left: 0;
     right: 0;
     z-index: 100;
-    background: #1a1a2e;
-    border: 1px solid #2a2a4a;
+    background: #ffffff;
+    border: 1px solid #e0e0e0;
     border-top: none;
     border-radius: 0 0 12px 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
     max-height: 360px;
     overflow-y: auto;
+    animation: dropdown-expand 0.3s ease-out;
 }
 
 .wallet-dropdown-item {
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(0, 0, 0, 0.04);
     transition: background 0.2s;
 }
 
@@ -4094,7 +5077,7 @@ body {
     gap: 6px;
     font-size: 14px;
     font-weight: 600;
-    color: #e0e0e0;
+    color: #333;
     margin-bottom: 2px;
 }
 
@@ -4111,7 +5094,7 @@ body {
 .wallet-dropdown-addr {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 11px;
-    color: #888;
+    color: #999;
 }
 
 .wallet-dropdown-actions {
@@ -4124,9 +5107,10 @@ body {
 
 .wallet-dropdown-footer {
     padding: 10px 16px;
-    border-top: 1px solid #2a2a4a;
+    border-top: 1px solid #e0e0e0;
     display: flex;
     justify-content: center;
+    gap: 8px;
 }
 
 /* ======== 钱包详情模态窗口 ======== */
@@ -4145,7 +5129,7 @@ body {
     display: flex;
     flex-direction: column;
     padding: 10px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid #ddd;
 }
 
 .wallet-detail-row:last-child {
@@ -4154,7 +5138,7 @@ body {
 
 .wallet-detail-label {
     font-size: 11px;
-    color: #888;
+    color: #999;
     margin-bottom: 4px;
     font-weight: 500;
     text-transform: uppercase;
@@ -4163,7 +5147,7 @@ body {
 
 .wallet-detail-value {
     font-size: 14px;
-    color: #e0e0e0;
+    color: #333;
     line-height: 1.4;
 }
 
@@ -4171,13 +5155,7 @@ body {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 12px;
     word-break: break-all;
-    color: #ccc;
-}
-
-.wallet-detail-divider {
-    height: 1px;
-    background: #2a2a4a;
-    margin: 4px 0;
+    color: #999;
 }
 
 /* ---- 交换页面 ---- */
@@ -4185,15 +5163,15 @@ body {
 .quote-display {
     margin-top: 12px;
     padding: 12px 16px;
-    background: #16213e;
+    background: #f0f4ff;
     border-radius: 10px;
-    border: 1px solid #2a2a4a;
+    border: 1px solid #e0e0e0;
     text-align: center;
 }
 
 .quote-label {
     font-size: 13px;
-    color: #888;
+    color: #999;
 }
 
 .quote-value {
@@ -4217,7 +5195,7 @@ body {
     flex: 1;
     padding: 6px 8px;
     border-radius: 8px;
-    border: 1px solid #2a2a4a;
+    border: 1px solid #e0e0e0;
     background: transparent;
     color: #999;
     font-size: 12px;
@@ -4228,7 +5206,7 @@ body {
 
 .fee-tab:hover {
     border-color: #667eea;
-    color: #ccc;
+    color: #555;
 }
 
 .fee-tab.active {
@@ -4236,5 +5214,316 @@ body {
     border-color: #667eea;
     color: #667eea;
     font-weight: 600;
+}
+
+/* ======== 页面切换动画 ======== */
+
+.page-enter-right {
+    animation: slide-in-right 0.3s ease-out;
+}
+
+.page-leave-left {
+    animation: slide-out-left 0.3s ease-in forwards;
+}
+
+.page-leave-right {
+    animation: slide-out-right 0.3s ease-in forwards;
+}
+
+@keyframes slide-in-right {
+    from { transform: translateX(100%); }
+    to   { transform: translateX(0); }
+}
+
+@keyframes slide-out-left {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-100%); }
+}
+
+@keyframes slide-out-right {
+    from { transform: translateX(0); }
+    to   { transform: translateX(100%); }
+}
+
+@keyframes dropdown-expand {
+    from {
+        opacity: 0;
+        transform: translateY(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* ======== 底部导航栏 ======== */
+
+.bottom-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-around;
+    background: #fff;
+    border-top: 1px solid #e0e0e0;
+    z-index: 500;
+    height: 50px;
+}
+
+.bottom-bar-btn {
+    border: none;
+    background: transparent;
+    color: #999;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.2s;
+    padding: 0 8px;
+}
+
+.bottom-bar-btn.active {
+    color: #667eea;
+}
+
+.bottom-bar-btn:hover {
+    color: #667eea;
+}
+
+/* ======== 资产页面 ======== */
+
+.assets-page {
+    padding-bottom: 60px;
+}
+
+.assets-ring-container {
+    position: relative;
+    width: 100%;
+    max-width: 360px;
+    margin: 0 auto 12px auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.assets-ring-header {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    margin-bottom: 4px;
+    width: 100%;
+}
+
+.ring-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+}
+
+.ring-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ring-legend-color {
+    width: 14px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.ring-legend-label {
+    font-size: 13px;
+    color: #333;
+}
+
+.assets-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 0 8px;
+}
+
+.toggle-zero-btn {
+    width: 20px;
+    height: 20px;
+    border: 1.5px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: all 0.2s;
+    flex-shrink: 0;
+}
+
+.toggle-zero-btn.checked {
+    background: #6bff6b;
+    border-color: #6bff6b;
+}
+
+.toggle-zero-check {
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+    line-height: 1;
+}
+
+.toggle-zero-label {
+    font-size: 13px;
+    color: #666;
+    cursor: pointer;
+    user-select: none;
+}
+
+.asset-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.asset-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 16px;
+    border-bottom: 1px solid #ddd;
+    cursor: pointer;
+}
+
+.asset-item:last-child {
+    border-bottom: none;
+}
+
+.asset-item-left {
+    flex: 1;
+    min-width: 0;
+}
+
+.asset-item-symbol {
+    font-size: 14px;
+    font-weight: 600;
+    color: #333;
+}
+
+.asset-item-right {
+    flex-shrink: 0;
+    max-width: 55%;
+}
+
+.asset-item-balance {
+    font-size: 13px;
+    color: #333;
+    font-family: "SF Mono", "Fira Code", monospace;
+    word-break: break-all;
+    text-align: right;
+    display: block;
+}
+
+.asset-item-balance.zero {
+    color: #bbb;
+}
+
+/* ======== 资产加载动画 ======== */
+
+.assets-loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 0;
+    gap: 12px;
+}
+
+.assets-spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid #e0e0e0;
+    border-top-color: #667eea;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ======== 资产详情页 ======== */
+
+.asset-detail-balance {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 14px;
+    color: #333;
+    word-break: break-all;
+    line-height: 1.6;
+    text-align: center;
+}
+
+.asset-tx-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid #eee;
+    cursor: pointer;
+    gap: 4px;
+}
+
+.asset-tx-item:last-child {
+    border-bottom: none;
+}
+
+.asset-tx-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+}
+
+.asset-tx-dir {
+    font-size: 14px;
+    font-weight: 700;
+    color: #667eea;
+    flex-shrink: 0;
+}
+
+.asset-tx-addr {
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 12px;
+    color: #555;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.asset-tx-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.asset-tx-value {
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+    font-family: "SF Mono", "Fira Code", monospace;
+}
+
+.asset-tx-status {
+    font-size: 12px;
+}
+
+.asset-tx-time {
+    width: 100%;
+    font-size: 11px;
+    color: #999;
+    padding-left: 22px;
 }
 "#;

@@ -28,7 +28,6 @@ pub fn weth_address(chain_id: u64) -> Option<&'static str>
         8453 => Some("0x4200000000000000000000000000000000000006"),     // Base
         137 => Some("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"),     // Polygon (WMATIC)
         56 => Some("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),      // BSC (WBNB)
-        43114 => Some("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7"),   // Avalanche (WAVAX)
         _ => None,
     }
 }
