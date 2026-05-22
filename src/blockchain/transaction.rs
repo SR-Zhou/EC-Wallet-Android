@@ -208,6 +208,22 @@ impl TransactionBuilder
         self
     }
 
+    pub fn max_fee_per_gas_u128(mut self, value: u128) -> Self
+    {
+        let mut bytes = [0u8; 32];
+        bytes[16..32].copy_from_slice(&value.to_be_bytes());
+        self.max_fee_per_gas = Some(U256::from_be_slice(&bytes));
+        self
+    }
+
+    pub fn max_priority_fee_per_gas_u128(mut self, value: u128) -> Self
+    {
+        let mut bytes = [0u8; 32];
+        bytes[16..32].copy_from_slice(&value.to_be_bytes());
+        self.max_priority_fee_per_gas = Some(U256::from_be_slice(&bytes));
+        self
+    }
+
     /// 构建交易
     /// 
     /// # 返回
@@ -408,7 +424,7 @@ fn encode_eip1559_for_signing(tx: &Transaction) -> Vec<u8>
         rlp::encode_bytes(&to_bytes),
         rlp::encode_u256(tx.value),
         rlp::encode_bytes(&tx.data),
-        rlp::encode_bytes(&[]), // access list (empty)
+        rlp::encode_list(&[]), // access list (empty)
     ];
 
     // EIP-1559 交易需要在前面加上 0x02 类型字节
@@ -539,7 +555,7 @@ fn encode_signed_eip1559(signed_tx: &SignedTransaction) -> Vec<u8>
         rlp::encode_bytes(&to_bytes),
         rlp::encode_u256(tx.value),
         rlp::encode_bytes(&tx.data),
-        rlp::encode_bytes(&[]), // access list
+        rlp::encode_list(&[]), // access list
         rlp::encode_u64(signed_tx.v),
         rlp::encode_u256(signed_tx.r),
         rlp::encode_u256(signed_tx.s),

@@ -1,5 +1,9 @@
 use crate::blockchain;
 use crate::crypto;
+use crate::data::{
+    self, BALANCE_CACHE, ChainInfo, RequestPriority, TX_CACHE, TX_SERIAL, TokenType, TxRecord,
+    all_chains, balance_key, default_chain, tx_cache_key,
+};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,22 +13,20 @@ use zeroize::Zeroize;
 // ============ 常量 ============
 const WALLETS_DIR: &str = "wallets";
 const WALLET_LIST_FILE: &str = "wallet_list.json";
-const API_KEY_FILE: &str = "etherscan_api_key";
 
 // ============ 应用状态 ============
 
 /// 应用页面
 #[derive(Debug, Clone, PartialEq)]
-enum Page
-{
+enum Page {
     /// 钱包列表页面（选择/管理钱包）
     WalletList,
-    /// 登录/解锁页面（指定钱包 id，仅在签名时弹出）
-    Login(String),
     /// 导入钱包页面
     Import,
     /// 主钱包页面
     Wallet,
+    /// 钱包资产页（底部资产 tab）
+    WalletAssets,
     /// 发送页面
     Send,
     /// 接收页面
@@ -39,25 +41,26 @@ enum Page
         chain_name: String,
         token: TokenType,
         symbol: String,
+        enter_anim: bool,
     },
 }
 
 /// 待执行的操作（签名后自动执行）
 #[derive(Debug, Clone)]
-enum PendingOp
-{
+enum PendingOp {
     None,
     Send {
         recipient: String,
         amount_units: u128,
+        amount_str: String,
         token: TokenType,
-        gas_percent: u32,
         chain: ChainInfo,
     },
     Swap {
         token_in_addr: String,
         token_out_addr: String,
         amount_in: u128,
+        amount_str: String,
         amount_out_min: u128,
         fee: u32,
         recipient: String,
@@ -70,8 +73,7 @@ enum PendingOp
 
 /// 单个钱包信息（存储在 wallet_list.json 中）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct WalletInfo
-{
+struct WalletInfo {
     /// 唯一 ID（用作 keystore 文件名）
     pub id: String,
     /// 用户给钱包起的名称
@@ -90,261 +92,32 @@ struct WalletInfo
 
 /// 钱包列表（wallet_list.json 的根结构）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct WalletList
-{
+struct WalletList {
     pub wallets: Vec<WalletInfo>,
     pub default_wallet_id: Option<String>,
 }
 
-/// 简化的交易记录（用于 UI 显示）
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct TxRecord
-{
-    pub hash: String,
-    pub from: String,
-    pub to: String,
-    pub value_eth: String,
-    pub value_wei: String,
-    pub timestamp: String,
-    pub block_number: String,
-    pub gas_used: String,
-    pub is_error: bool,
-    /// true = 发出, false = 收到
-    pub is_outgoing: bool,
-}
-
-/// 链信息（GUI 用）
-#[derive(Debug, Clone, PartialEq)]
-struct ChainInfo
-{
-    /// 显示名称
-    pub name: &'static str,
-    /// 短名称（选项卡显示用）
-    pub short_name: &'static str,
-    /// 链 ID
-    pub chain_id: u64,
-    /// RPC URL
-    pub rpc_url: &'static str,
-    /// 原生代币符号（如 ETH、MATIC、BNB）
-    pub native_symbol: &'static str,
-    /// 原生代币图标
-    pub native_icon: &'static str,
-    /// 链图标
-    pub chain_icon: &'static str,
-    /// USDC 合约地址（None 表示该链不支持）
-    pub usdc_address: Option<&'static str>,
-    /// USDT 合约地址（None 表示该链不支持）
-    pub usdt_address: Option<&'static str>,
-    /// Etherscan V2 API 基础 URL
-    pub explorer_api_url: &'static str,
-    /// 区块浏览器 URL
-    pub explorer_url: &'static str,
-}
-
-/// 获取所有支持的链
-fn all_chains() -> Vec<ChainInfo>
-{
-    vec![
-        ChainInfo {
-            name: "Ethereum",
-            short_name: "Ethereum",
-            chain_id: 1,
-            rpc_url: "https://ethereum-rpc.publicnode.com",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "Ξ",
-            usdc_address: Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            usdt_address: Some("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://etherscan.io",
-        },
-        ChainInfo {
-            name: "Arbitrum One",
-            short_name: "Arbitrum",
-            chain_id: 42161,
-            rpc_url: "https://arb1.arbitrum.io/rpc",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "🔵",
-            usdc_address: Some("0xaf88d065e77c8cC2239327C5EDb3A432268e5831"),
-            usdt_address: Some("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://arbiscan.io",
-        },
-        ChainInfo {
-            name: "Base",
-            short_name: "Base",
-            chain_id: 8453,
-            rpc_url: "https://mainnet.base.org",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "🔵",
-            usdc_address: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
-            usdt_address: None,
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://basescan.org",
-        },
-        ChainInfo {
-            name: "Optimism",
-            short_name: "Optimism",
-            chain_id: 10,
-            rpc_url: "https://mainnet.optimism.io",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "🔴",
-            usdc_address: Some("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"),
-            usdt_address: Some("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://optimistic.etherscan.io",
-        },
-        ChainInfo {
-            name: "Polygon",
-            short_name: "Polygon",
-            chain_id: 137,
-            rpc_url: "https://polygon-rpc.com",
-            native_symbol: "POL",
-            native_icon: "🟣",
-            chain_icon: "🟣",
-            usdc_address: Some("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
-            usdt_address: Some("0xc2132D05D31c914a87C6611C10748AEb04B58e8F"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://polygonscan.com",
-        },
-        ChainInfo {
-            name: "BNB Smart Chain",
-            short_name: "BSC",
-            chain_id: 56,
-            rpc_url: "https://bsc-dataseed.binance.org",
-            native_symbol: "BNB",
-            native_icon: "🟡",
-            chain_icon: "🟡",
-            usdc_address: Some("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"),
-            usdt_address: Some("0x55d398326f99059fF775485246999027B3197955"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://bscscan.com",
-        },
-        ChainInfo {
-            name: "zkSync Era",
-            short_name: "zkSync",
-            chain_id: 324,
-            rpc_url: "https://mainnet.era.zksync.io",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "🔷",
-            usdc_address: Some("0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4"),
-            usdt_address: None,
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://explorer.zksync.io",
-        },
-        ChainInfo {
-            name: "Linea",
-            short_name: "Linea",
-            chain_id: 59144,
-            rpc_url: "https://rpc.linea.build",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "➖",
-            usdc_address: Some("0x176211869cA2b568f2A7D4EE941E073a821EE1ff"),
-            usdt_address: None,
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://lineascan.build",
-        },
-        ChainInfo {
-            name: "Scroll",
-            short_name: "Scroll",
-            chain_id: 534352,
-            rpc_url: "https://rpc.scroll.io",
-            native_symbol: "ETH",
-            native_icon: "🔷",
-            chain_icon: "📜",
-            usdc_address: Some("0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4"),
-            usdt_address: Some("0xf55BEC9cafDbE8730f096Aa55dad6D22d44099Df"),
-            explorer_api_url: "https://api.etherscan.io",
-            explorer_url: "https://scrollscan.com",
-        },
-    ]
-}
-
-/// 获取默认链（Ethereum）
-fn default_chain() -> ChainInfo
-{
-    all_chains().into_iter().next().unwrap()
-}
-
-/// 支持的代币类型
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-enum TokenType
-{
-    Native,
-    USDC,
-    USDT,
-}
-
-impl TokenType
-{
-    /// 获取代币符号（根据当前链）
-    fn symbol(&self, chain: &ChainInfo) -> String
-    {
-        match self
-        {
-            TokenType::Native => chain.native_symbol.to_string(),
-            TokenType::USDC => "USDC".to_string(),
-            TokenType::USDT => "USDT".to_string(),
-        }
-    }
-
-    /// ERC20 合约地址（根据当前链），Native 返回 None
-    fn contract_address(&self, chain: &ChainInfo) -> Option<String>
-    {
-        match self
-        {
-            TokenType::Native => None,
-            TokenType::USDC => chain.usdc_address.map(|s| s.to_string()),
-            TokenType::USDT => chain.usdt_address.map(|s| s.to_string()),
-        }
-    }
-
-    /// 代币精度（根据链返回不同精度）
-    fn decimals(&self, chain: &ChainInfo) -> u8
-    {
-        match self
-        {
-            TokenType::Native => 18,
-            TokenType::USDC | TokenType::USDT => {
-                // BNB Smart Chain (chain_id: 56) 上的 USDC 和 USDT 使用 18 位精度
-                if chain.chain_id == 56 {
-                    18
-                } else {
-                    6
-                }
-            }
-        }
-    }}
-
 // ============ 入口 ============
 
-pub fn launch()
-{
+pub fn launch() {
     dioxus::launch(app);
 }
 
 // ============ 主组件 ============
 
-fn app() -> Element
-{
+fn app() -> Element {
+    use_hook(|| {
+        data::start_request_worker();
+    });
+
     let page = use_signal(|| {
         let list = load_wallet_list();
-        if list.wallets.is_empty()
-        {
+        if list.wallets.is_empty() {
             Page::Import
-        }
-        else if let Some(ref default_id) = list.default_wallet_id
-        {
+        } else if let Some(ref default_id) = list.default_wallet_id {
             *CURRENT_WALLET_ID.write() = Some(default_id.clone());
             Page::Wallet
-        }
-        else
-        {
+        } else {
             Page::WalletList
         }
     });
@@ -354,168 +127,14 @@ fn app() -> Element
         div { class: "app-container",
             match page() {
                 Page::WalletList => rsx! { WalletListPage { page } },
-                Page::Login(wallet_id) => rsx! { LoginPage { page, page_stack, wallet_id } },
                 Page::Import => rsx! { ImportPage { page } },
-                Page::Wallet => rsx! { WalletPage { page, page_stack } },
+                Page::Wallet => rsx! { WalletPage { page, page_stack, initial_tab: HomeTab::Home } },
+                Page::WalletAssets => rsx! { WalletPage { page, page_stack, initial_tab: HomeTab::Assets } },
                 Page::Send => rsx! { SendPage { page, page_stack } },
                 Page::Receive => rsx! { ReceivePage { page, page_stack } },
                 Page::Swap => rsx! { SwapPage { page, page_stack } },
                 Page::TransactionDetail(tx) => rsx! { TransactionDetailPage { page, page_stack, tx } },
-                Page::AssetDetail { chain_id, chain_name, token, symbol } => rsx! { AssetDetailPage { page, page_stack, chain_id, chain_name, token, symbol } },
-            }
-        }
-    }
-}
-
-// ============ 登录页面 ============
-
-#[component]
-fn LoginPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, wallet_id: String) -> Element
-{
-    let mut password = use_signal(|| String::new());
-    let error_msg = use_signal(|| String::new());
-    let loading = use_signal(|| false);
-
-    // 获取钱包信息用于显示
-    let wallet_list = load_wallet_list();
-    let wallet_info = wallet_list.wallets.iter().find(|w| w.id == wallet_id).cloned();
-    let wallet_name = wallet_info.as_ref().map(|w| w.name.clone()).unwrap_or_else(|| "未知钱包".to_string());
-    let wallet_address = wallet_info.as_ref().map(|w| shorten_address(&w.address)).unwrap_or_default();
-    let wid = wallet_id.clone();
-
-    let do_unlock = {
-        let wid = wid.clone();
-        move |password: &Signal<String>, mut error_msg: Signal<String>, mut loading: Signal<bool>| {
-            let pw = password().trim().to_string();
-            if pw.is_empty()
-            {
-                error_msg.set("请输入密码".into());
-                return;
-            }
-            loading.set(true);
-            error_msg.set(String::new());
-
-            let keystore_path = get_wallet_keystore_path(&wid);
-            match crypto::keystore::load(pw, &keystore_path, false)
-            {
-                Ok(sk_hex) =>
-                {
-                    // 设置 SK（调用方会在操作完成后 zeroize）
-                    UNLOCKED_SK.write().replace(sk_hex);
-                }
-                Err(e) =>
-                {
-                    error_msg.set(format!("解锁失败: {}", e));
-                }
-            }
-            loading.set(false);
-        }
-    };
-
-    let mut leave_anim = use_signal(|| String::new());
-    let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
-
-    let go_back = move || {
-        let mut stack = page_stack;
-        let mut p = page;
-        if let Some(prev) = stack.write().pop() {
-            p.set(prev);
-        }
-    };
-
-    let on_touch_start = move |evt: Event<TouchData>| {
-        if let Some(touch) = evt.touches().first() {
-            let coords = touch.client_coordinates();
-            touch_start.set((coords.x, coords.y));
-        }
-    };
-
-    let on_touch_end = move |evt: Event<TouchData>| {
-        let (start_x, start_y) = touch_start();
-        if let Some(touch) = evt.touches_changed().first() {
-            let coords = touch.client_coordinates();
-            let dx = coords.x - start_x;
-            let dy = coords.y - start_y;
-            if dx.abs() > 100.0 && dx.abs() > dy.abs() {
-                if dx > 0.0 {
-                    leave_anim.set("page-leave-right".into());
-                } else {
-                    leave_anim.set("page-leave-left".into());
-                }
-            }
-        }
-    };
-
-    let on_animation_end = move |_: Event<AnimationData>| {
-        if !leave_anim().is_empty() {
-            go_back();
-        }
-    };
-
-    let error = error_msg;
-    let pw = password;
-
-    rsx! {
-        div {
-            class: "page login-page {leave_anim}",
-            ontouchstart: on_touch_start,
-            ontouchend: on_touch_end,
-            onanimationend: on_animation_end,
-            div { class: "card",
-                h1 { class: "title", "🔐 EC Wallet" }
-                p { class: "subtitle", "签名: {wallet_name}" }
-                if !wallet_address.is_empty() {
-                    p { class: "subtitle", style: "margin-top: -16px; font-family: monospace; font-size: 12px; color: #999;", "{wallet_address}" }
-                }
-
-                div { class: "form-group",
-                    label { "密码" }
-                    input {
-                        r#type: "password",
-                        placeholder: "请输入密码...",
-                        value: "{password}",
-                        oninput: move |e| password.set(e.value()),
-                        onkeypress: {
-                            let do_unlock = do_unlock.clone();
-                            move |e: Event<KeyboardData>| {
-                                if e.key() == Key::Enter {
-                                    do_unlock(&pw, error, loading);
-                                    if UNLOCKED_SK.read().is_some() {
-                                        go_back();
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }
-
-                if !error_msg().is_empty() {
-                    p { class: "error", "{error_msg}" }
-                }
-
-                button {
-                    class: "btn btn-primary",
-                    disabled: loading(),
-                    onclick: {
-                        let do_unlock = do_unlock.clone();
-                        move |_: Event<MouseData>| {
-                            do_unlock(&pw, error, loading);
-                            // 解锁成功后自动返回
-                            if UNLOCKED_SK.read().is_some() {
-                                go_back();
-                            }
-                        }
-                    },
-                    if loading() { "解锁中..." } else { "🔓 解锁并签名" }
-                }
-
-                div { class: "divider" }
-
-                button {
-                    class: "btn btn-secondary",
-                    onclick: move |_| go_back(),
-                    "← 返回"
-                }
+                Page::AssetDetail { chain_id, chain_name, token, symbol, enter_anim } => rsx! { AssetDetailPage { page, page_stack, chain_id, chain_name, token, symbol, enter_anim } },
             }
         }
     }
@@ -524,8 +143,7 @@ fn LoginPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, wallet_id: Strin
 // ============ 导入钱包页面 ============
 
 #[component]
-fn ImportPage(page: Signal<Page>) -> Element
-{
+fn ImportPage(page: Signal<Page>) -> Element {
     let mut private_key = use_signal(|| String::new());
     let mut password = use_signal(|| String::new());
     let mut password_confirm = use_signal(|| String::new());
@@ -538,48 +156,38 @@ fn ImportPage(page: Signal<Page>) -> Element
         let pw = password().trim().to_string();
         let pw2 = password_confirm().trim().to_string();
         let name = wallet_name_input().trim().to_string();
-        if sk.is_empty()
-        {
+        if sk.is_empty() {
             error_msg.set("请输入私钥".into());
             return;
         }
-        if name.is_empty()
-        {
+        if name.is_empty() {
             error_msg.set("请输入钱包名称".into());
             return;
         }
-        if pw.is_empty()
-        {
+        if pw.is_empty() {
             error_msg.set("请输入密码".into());
             return;
         }
-        if pw != pw2
-        {
+        if pw != pw2 {
             error_msg.set("两次密码不一致".into());
             return;
         }
 
-        let sk_clean = if sk.starts_with("0x") || sk.starts_with("0X")
-        {
+        let sk_clean = if sk.starts_with("0x") || sk.starts_with("0X") {
             sk[2..].to_string()
-        }
-        else
-        {
+        } else {
             sk.clone()
         };
 
-        if !blockchain::conversion::is_valid_private_key(&sk_clean)
-        {
+        if !blockchain::conversion::is_valid_private_key(&sk_clean) {
             error_msg.set("私钥格式无效".into());
             return;
         }
 
         // 计算地址
-        let address = match blockchain::account::private_key_hex_to_address(&sk_clean)
-        {
+        let address = match blockchain::account::private_key_hex_to_address(&sk_clean) {
             Ok(addr) => addr,
-            Err(e) =>
-            {
+            Err(e) => {
                 error_msg.set(format!("私钥无效: {}", e));
                 return;
             }
@@ -589,11 +197,9 @@ fn ImportPage(page: Signal<Page>) -> Element
         error_msg.set(String::new());
 
         // 生成钱包 ID
-        let wallet_id = match generate_wallet_id(&sk_clean)
-        {
+        let wallet_id = match generate_wallet_id(&sk_clean) {
             Ok(id) => id,
-            Err(e) =>
-            {
+            Err(e) => {
                 error_msg.set(format!("生成钱包 ID 失败: {}", e));
                 loading.set(false);
                 return;
@@ -603,10 +209,8 @@ fn ImportPage(page: Signal<Page>) -> Element
 
         // 存储 keystore 文件
         let keystore_path = get_wallet_keystore_path(&wallet_id);
-        match crypto::keystore::store(pw, sk_clean.clone(), &keystore_path, false)
-        {
-            Ok(()) =>
-            {
+        match crypto::keystore::store(pw, sk_clean.clone(), &keystore_path, false) {
+            Ok(()) => {
                 // 计算公钥
                 let (pk_x, pk_y) = blockchain::account::private_key_hex_to_public_key_xy(&sk_clean)
                     .unwrap_or_default();
@@ -624,8 +228,7 @@ fn ImportPage(page: Signal<Page>) -> Element
                 // 如果是第一个钱包，设为默认
                 let is_first = list.wallets.is_empty();
                 list.wallets.push(info);
-                if is_first
-                {
+                if is_first {
                     list.default_wallet_id = Some(wallet_id.clone());
                 }
                 save_wallet_list(&list);
@@ -633,8 +236,7 @@ fn ImportPage(page: Signal<Page>) -> Element
                 *CURRENT_WALLET_ID.write() = Some(wallet_id);
                 page.set(Page::Wallet);
             }
-            Err(e) =>
-            {
+            Err(e) => {
                 error_msg.set(format!("导入失败: {}", e));
             }
         }
@@ -643,15 +245,11 @@ fn ImportPage(page: Signal<Page>) -> Element
 
     let go_login = move |_| {
         let list = load_wallet_list();
-        if !list.wallets.is_empty()
-        {
-            if let Some(ref default_id) = list.default_wallet_id
-            {
+        if !list.wallets.is_empty() {
+            if let Some(ref default_id) = list.default_wallet_id {
                 *CURRENT_WALLET_ID.write() = Some(default_id.clone());
                 page.set(Page::Wallet);
-            }
-            else
-            {
+            } else {
                 page.set(Page::WalletList);
             }
         }
@@ -742,8 +340,7 @@ fn ImportPage(page: Signal<Page>) -> Element
 // ============ 钱包列表页面 ============
 
 #[component]
-fn WalletListPage(page: Signal<Page>) -> Element
-{
+fn WalletListPage(page: Signal<Page>) -> Element {
     let mut wallet_list = use_signal(|| load_wallet_list());
     let mut confirm_delete: Signal<Option<String>> = use_signal(|| None);
     let mut show_wallet_detail: Signal<Option<WalletInfo>> = use_signal(|| None);
@@ -764,17 +361,7 @@ fn WalletListPage(page: Signal<Page>) -> Element
 
     let mut on_delete = move |id: String| {
         let mut list = wallet_list();
-        // 删除 keystore 文件
-        let path = get_wallet_keystore_path(&id);
-        let _ = std::fs::remove_file(path);
-        // 从列表移除
-        list.wallets.retain(|w| w.id != id);
-        // 如果删除的是默认钱包，重置默认
-        if list.default_wallet_id.as_ref() == Some(&id)
-        {
-            list.default_wallet_id = list.wallets.first().map(|w| w.id.clone());
-        }
-        save_wallet_list(&list);
+        delete_wallet(&id, &mut list);
         wallet_list.set(list);
         confirm_delete.set(None);
     };
@@ -947,15 +534,17 @@ fn WalletListPage(page: Signal<Page>) -> Element
 // ============ 钱包主页面 ============
 
 #[derive(Debug, Clone, PartialEq)]
-enum HomeTab
-{
+enum HomeTab {
     Home,
     Assets,
 }
 
 #[component]
-fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn WalletPage(
+    page: Signal<Page>,
+    page_stack: Signal<Vec<Page>>,
+    initial_tab: HomeTab,
+) -> Element {
     let address = get_current_wallet_address();
     let mut selected_token = use_signal(|| TokenType::Native);
     let mut show_chain_dropdown = use_signal(|| false);
@@ -966,36 +555,26 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     let mut confirm_delete: Signal<Option<String>> = use_signal(|| None);
     let mut wallet_list_version = use_signal(|| 0u32); // 用于触发钱包列表刷新
     let mut balance = use_signal(|| "加载中...".to_string());
+    let mut balance_error = use_signal(|| String::new());
     let mut transactions: Signal<Vec<TxRecord>> = use_signal(Vec::new);
     let mut tx_loading = use_signal(|| false);
     let mut tx_error = use_signal(|| String::new());
-    let mut api_key_input = use_signal(|| ETHERSCAN_KEY.read().clone());
-    let mut api_key_saved = use_signal(|| false);
     let refresh_counter = use_signal(|| 0u32);
     let mut balance_refresh_counter = use_signal(|| 0u32);
     let mut tx_refresh_counter = use_signal(|| 0u32);
-    let mut current_tab = use_signal(|| HomeTab::Home);
+    let mut current_tab = use_signal(move || initial_tab);
 
-    let addr = address.clone();
-    let addr_for_tx = addr.clone();
-
-    // 从文件加载缓存到内存（先清空旧钱包数据，再加载新钱包缓存）
-    {
-        let mut balance_cache = BALANCE_CACHE.write();
-        let mut tx_cache = TX_CACHE.write();
-        *balance_cache = HashMap::new();
-        *tx_cache = HashMap::new();
-        if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-            if let Some(cache) = load_wallet_cache(wid) {
-                *balance_cache = cache.balances;
-                *tx_cache = cache.transactions;
-            }
-        }
-    }
+    // 钱包缓存由 data 层激活；钱包切换时它会加载对应缓存并丢弃旧页面的结果。
+    use_effect(move || {
+        data::activate_wallet(CURRENT_WALLET_ID.read().clone());
+    });
 
     // 余额随 selected_token / selected_chain / refresh 变化而获取（优先使用缓存）
     let address_for_balance = address.clone();
     use_effect(move || {
+        if current_tab() != HomeTab::Home {
+            return;
+        }
         let _ = refresh_counter();
         let _ = balance_refresh_counter();
         let addr = address_for_balance.clone();
@@ -1003,102 +582,63 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let chain = SELECTED_CHAIN.read().clone();
         let cache_key = balance_key(chain.chain_id, &token);
 
-        // 检查缓存
         if let Some(cached) = BALANCE_CACHE.read().get(&cache_key) {
             match cached {
-                Ok(bal) => balance.set(truncate_balance_for_display(bal)),
-                Err(e) => balance.set(format!("错误: {}", e)),
-            }
-            return;
-        }
-
-        // 无缓存，从网络获取（去重：同一 key 只发一次请求）
-        if IN_FLIGHT.read().contains(&cache_key) {
-            return;
-        }
-        IN_FLIGHT.write().insert(cache_key.clone());
-        balance.set("加载中...".to_string());
-        spawn(async move {
-            let wallet_id = CURRENT_WALLET_ID.read().clone();
-            match fetch_token_balance(&addr, &token, &chain).await
-            {
                 Ok(bal) => {
-                    BALANCE_CACHE.write().insert(cache_key.clone(), Ok(bal.clone()));
-                    balance.set(truncate_balance_for_display(&bal));
-                    if let Some(ref wid) = wallet_id {
-                        save_wallet_cache(wid);
-                    }
+                    balance_error.set(String::new());
+                    balance.set(truncate_balance_for_display(bal));
                 }
                 Err(e) => {
-                    BALANCE_CACHE.write().insert(cache_key.clone(), Err(e.clone()));
-                    balance.set(format!("错误: {}", e));
-                    if let Some(ref wid) = wallet_id {
-                        save_wallet_cache(wid);
-                    }
+                    balance.set(String::new());
+                    balance_error.set(format!("获取余额失败: {}", e));
                 }
             }
-            IN_FLIGHT.write().remove(&cache_key);
-        });
+            return;
+        }
+
+        balance_error.set(String::new());
+        balance.set("加载中...".to_string());
+        if let Some(wallet_id) = CURRENT_WALLET_ID.read().clone() {
+            data::enqueue_balance(&wallet_id, &addr, chain, token, RequestPriority::High);
+        }
     });
 
-    // 交易记录随 selected_chain / refresh 变化而获取（优先使用缓存）
+    // 交易记录随 selected_chain / selected_token / refresh 变化而获取（优先使用缓存）
     use_effect(move || {
+        if current_tab() != HomeTab::Home {
+            return;
+        }
+        let _ = *TX_SERIAL.read();
         let _ = refresh_counter();
         let _ = tx_refresh_counter();
-        let addr = addr_for_tx.clone();
+        let addr = get_current_wallet_address();
         let chain = SELECTED_CHAIN.read().clone();
+        let token = selected_token().clone();
         let chain_id = chain.chain_id;
+        let cache_key = tx_cache_key(chain_id, &token);
 
-        // 检查缓存
-        if let Some(cached) = TX_CACHE.read().get(&chain_id) {
+        if let Some(cached) = TX_CACHE.read().get(&cache_key) {
             match cached {
                 Ok(txs) => {
                     tx_error.set(String::new());
                     transactions.set(txs.clone());
+                    tx_loading.set(false);
                 }
                 Err(e) => {
                     transactions.set(Vec::new());
                     tx_error.set(format!("获取交易历史失败: {}", e));
+                    tx_loading.set(false);
                 }
             }
             return;
         }
 
-        // 无缓存，从网络获取
-        // 无缓存，从网络获取（去重：同一链只发一次 tx 请求）
-        let tx_flight_key = format!("tx_{}", chain_id);
-        if IN_FLIGHT.read().contains(&tx_flight_key) {
-            return;
-        }
-        IN_FLIGHT.write().insert(tx_flight_key.clone());
+        transactions.set(Vec::new());
         tx_loading.set(true);
         tx_error.set(String::new());
-        spawn(async move {
-            let wallet_id = CURRENT_WALLET_ID.read().clone();
-            match fetch_transactions(&addr, &chain).await
-            {
-                Ok(txs) =>
-                {
-                    TX_CACHE.write().insert(chain_id, Ok(txs.clone()));
-                    tx_error.set(String::new());
-                    transactions.set(txs);
-                    if let Some(ref wid) = wallet_id {
-                        save_wallet_cache(wid);
-                    }
-                }
-                Err(e) =>
-                {
-                    TX_CACHE.write().insert(chain_id, Err(e.clone()));
-                    transactions.set(Vec::new());
-                    tx_error.set(format!("获取交易历史失败: {}", e));
-                    if let Some(ref wid) = wallet_id {
-                        save_wallet_cache(wid);
-                    }
-                }
-            }
-            tx_loading.set(false);
-            IN_FLIGHT.write().remove(&tx_flight_key);
-        });
+        if let Some(wallet_id) = CURRENT_WALLET_ID.read().clone() {
+            data::enqueue_transactions(&wallet_id, &addr, chain, RequestPriority::High);
+        }
     });
 
     let addr_display = address.clone();
@@ -1126,7 +666,7 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                 let current_wallet_info = wallet_list.wallets.iter().find(|w| w.id == current_wid).cloned();
                 let current_wallet_name = current_wallet_info.as_ref().map(|w| w.name.clone()).unwrap_or_else(|| "未知钱包".to_string());
                 let default_wid = wallet_list.default_wallet_id.clone().unwrap_or_default();
-                
+
                 rsx! {
                     div { class: "wallet-selector-container",
                         button {
@@ -1252,18 +792,11 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                                                                     onclick: move |_| {
                                                                         // 删除钱包
                                                                         let mut list = load_wallet_list();
-                                                                        list.wallets.retain(|w| w.id != del_id);
-                                                                        // 如果删除的是默认钱包，自动选择第一个钱包为新默认
-                                                                        if list.default_wallet_id.as_ref() == Some(&del_id) {
-                                                                            list.default_wallet_id = list.wallets.first().map(|w| w.id.clone());
-                                                                        }
+                                                                        delete_wallet(&del_id, &mut list);
                                                                         // 如果删除的是当前钱包，返回钱包列表页面
                                                                         if del_id == curr_wid {
-                                                                            save_wallet_list(&list);
                                                                             *CURRENT_WALLET_ID.write() = None;
                                                                             page.set(Page::WalletList);
-                                                                        } else {
-                                                                            save_wallet_list(&list);
                                                                         }
                                                                         confirm_delete.set(None);
                                                                         show_wallet_dropdown.set(false);
@@ -1388,9 +921,8 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                         onclick: move |_| {
                             let chain = SELECTED_CHAIN.read().clone();
                             let token = selected_token();
-                            BALANCE_CACHE.write().remove(&balance_key(chain.chain_id, &token));
                             if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                                save_wallet_cache(wid);
+                                data::clear_balance(wid, chain.chain_id, &token);
                             }
                             balance_refresh_counter.set(balance_refresh_counter() + 1);
                         },
@@ -1398,12 +930,15 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     }
                 }
                 div { class: "account-address",
-                    span { class: "label", "地址" }
                     span { class: "address", title: "{addr_display}", "{short_addr}" }
                 }
-                div { class: "account-balance",
-                    span { class: "balance-value", "{balance}" }
-                    span { class: "balance-unit", "{selected_token().symbol(&chain)}" }
+                if !balance_error().is_empty() {
+                    p { class: "error", "{balance_error}" }
+                } else {
+                    div { class: "account-balance",
+                        span { class: "balance-value", "{balance}" }
+                        span { class: "balance-unit", "{selected_token().symbol(&chain)}" }
+                    }
                 }
                 div { class: "action-buttons",
                     button {
@@ -1412,7 +947,7 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                             page_stack.write().push(Page::Wallet);
                             page.set(Page::Send);
                         },
-                        "📤 发送"
+                        "发送"
                     }
                     button {
                         class: "btn btn-action",
@@ -1420,7 +955,7 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                             page_stack.write().push(Page::Wallet);
                             page.set(Page::Receive);
                         },
-                        "📥 接收"
+                        "接收"
                     }
                     button {
                         class: "btn btn-action",
@@ -1428,7 +963,7 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                             page_stack.write().push(Page::Wallet);
                             page.set(Page::Swap);
                         },
-                        "🔄 交换"
+                        "交换"
                     }
                 }
             }
@@ -1440,9 +975,8 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                         class: "btn btn-small btn-secondary",
                         onclick: move |_| {
                             let chain = SELECTED_CHAIN.read().clone();
-                            TX_CACHE.write().remove(&chain.chain_id);
                             if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                                save_wallet_cache(wid);
+                                data::clear_chain_transactions(wid, chain.chain_id);
                             }
                             tx_refresh_counter.set(tx_refresh_counter() + 1);
                         },
@@ -1465,41 +999,6 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                 div { class: "tx-list",
                     for tx in transactions() {
                         TxItem { tx: tx.clone(), my_address: addr_display.clone(), page, page_stack }
-                    }
-                }
-            }
-            if ETHERSCAN_KEY.read().is_empty() {
-                div { class: "card",
-                    h2 { class: "section-title", "⚙️ Etherscan API Key" }
-                    p { class: "subtitle", style: "margin-bottom: 12px; text-align: left;",
-                        "查看交易历史需要 Etherscan API Key（可在 "
-                        a { href: "https://etherscan.io/myapikey", style: "color: #667eea;", "etherscan.io" }
-                        " 免费注册获取）"
-                    }
-                    div { class: "form-group",
-                        input {
-                            r#type: "password",
-                            placeholder: "输入 Etherscan API Key...",
-                            value: "{api_key_input}",
-                            oninput: move |e| {
-                                api_key_input.set(e.value());
-                                api_key_saved.set(false);
-                            },
-                        }
-                    }
-                    button {
-                        class: "btn btn-primary",
-                        style: "margin-bottom: 8px;",
-                        onclick: move |_| {
-                            let key = api_key_input().trim().to_string();
-                            save_api_key(&key);
-                            *ETHERSCAN_KEY.write() = key;
-                            api_key_saved.set(true);
-                        },
-                        "💾 保存 API Key"
-                    }
-                    if api_key_saved() {
-                        p { style: "color: #6bff6b; font-size: 13px; text-align: center;", "✅ 已保存！重新进入钱包页面后生效" }
                     }
                 }
             }
@@ -1536,8 +1035,7 @@ fn WalletPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 // ============ 资产页面 ============
 
 #[derive(Debug, Clone, PartialEq)]
-struct AssetItem
-{
+struct AssetItem {
     chain_id: u64,
     chain_name: String,
     token: TokenType,
@@ -1548,25 +1046,29 @@ struct AssetItem
 
 /// 预定义调色板（最多支持 30 种代币-链组合）
 const ASSET_COLORS: &[&str] = &[
-    "#667eea", "#f093fb", "#4facfe", "#43e97b", "#fa709a",
-    "#fee140", "#30cfd0", "#a8c0ff", "#f86ca7", "#ff6b6b",
-    "#f9d423", "#00b4db", "#f5576c", "#005bea", "#48c6ef",
-    "#6bff6b", "#f9a826", "#a18cd1", "#ffecd2", "#fcb69f",
-    "#cfd9df", "#b24592", "#e14b5d", "#f3a183", "#4a00e0",
-    "#8e2de2", "#00bf8f", "#11998e", "#38ef7d", "#ffb347",
+    "#667eea", "#f093fb", "#4facfe", "#43e97b", "#fa709a", "#fee140", "#30cfd0", "#a8c0ff",
+    "#f86ca7", "#ff6b6b", "#f9d423", "#00b4db", "#f5576c", "#005bea", "#48c6ef", "#6bff6b",
+    "#f9a826", "#a18cd1", "#ffecd2", "#fcb69f", "#cfd9df", "#b24592", "#e14b5d", "#f3a183",
+    "#4a00e0", "#8e2de2", "#00bf8f", "#11998e", "#38ef7d", "#ffb347",
 ];
 
 #[component]
-fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal<HomeTab>, page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn AssetsPage(
+    address: String,
+    refresh_counter: Signal<u32>,
+    current_tab: Signal<HomeTab>,
+    page: Signal<Page>,
+    page_stack: Signal<Vec<Page>>,
+) -> Element {
     let mut assets = use_signal(|| Vec::<AssetItem>::new());
     let mut loading = use_signal(|| true);
-    let mut is_fetching = use_signal(|| false);
-    let assets_version = use_signal(|| 0u32);
     let mut serial_trigger = use_signal(|| 0u32);
 
     // 收集所有链 × 代币的数据（读取缓存），并触发串行加载
     use_effect(move || {
+        if current_tab() != HomeTab::Assets {
+            return;
+        }
         let _ = refresh_counter();
         let _ = serial_trigger();
         loading.set(true);
@@ -1577,8 +1079,12 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
         for chain in &chains {
             let tokens = vec![TokenType::Native, TokenType::USDC, TokenType::USDT];
             for token in &tokens {
-                if *token == TokenType::USDC && chain.usdc_address.is_none() { continue; }
-                if *token == TokenType::USDT && chain.usdt_address.is_none() { continue; }
+                if *token == TokenType::USDC && chain.usdc_address.is_none() {
+                    continue;
+                }
+                if *token == TokenType::USDT && chain.usdt_address.is_none() {
+                    continue;
+                }
 
                 let cache_key = balance_key(chain.chain_id, &token);
                 if let Some(cached) = BALANCE_CACHE.read().get(&cache_key) {
@@ -1621,75 +1127,29 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
 
         assets.set(items);
 
-        // 串行获取未缓存的资产：逐对请求，全部完成后批量写入
-        if !need_fetch.is_empty() {
-            // 已有串行加载在跑则跳过，防止并发 spawn 抢锁卡死
-            if is_fetching() {
-                return;
+        // 资产页只入队。余额是正常优先级，交易历史预取为低优先级。
+        loading.set(!need_fetch.is_empty());
+        if let Some(wallet_id) = CURRENT_WALLET_ID.read().clone() {
+            for (chain, token) in need_fetch {
+                data::enqueue_balance(&wallet_id, &address, chain, token, RequestPriority::Normal);
             }
-            is_fetching.set(true);
-            let addr = address.clone();
-            let mut version = assets_version;
-            spawn(async move {
-                let mut new_balances = HashMap::new();
-                let mut new_txs: HashMap<u64, Result<Vec<TxRecord>, String>> = HashMap::new();
-                let mut fetched_tx_chains = HashSet::new();
 
-                for (chain, token) in &need_fetch {
-                    let cache_key = balance_key(chain.chain_id, token);
-                    if IN_FLIGHT.read().contains(&cache_key) {
-                        continue;
-                    }
-                    IN_FLIGHT.write().insert(cache_key.clone());
-
-                    let bal_result = fetch_token_balance(&addr, token, chain).await;
-                    new_balances.insert(cache_key.clone(), bal_result);
-                    IN_FLIGHT.write().remove(&cache_key);
-
-                    let tx_flight_key = format!("tx_{}", chain.chain_id);
-                    if !fetched_tx_chains.contains(&chain.chain_id) && !IN_FLIGHT.read().contains(&tx_flight_key) {
-                        IN_FLIGHT.write().insert(tx_flight_key.clone());
-                        let tx_result = fetch_transactions(&addr, chain).await;
-                        new_txs.insert(chain.chain_id, tx_result);
-                        IN_FLIGHT.write().remove(&tx_flight_key);
-                        fetched_tx_chains.insert(chain.chain_id);
-                    }
-
-                    // 间隔 1 秒
-                    futures_timer::Delay::new(std::time::Duration::from_secs(1)).await;
+            for chain in chains {
+                if chain.blockscout_api_url.is_some()
+                    && !TX_CACHE
+                        .read()
+                        .contains_key(&tx_cache_key(chain.chain_id, &TokenType::Native))
+                {
+                    data::enqueue_transactions(&wallet_id, &address, chain, RequestPriority::Low);
                 }
-
-                // 全部完成后批量写入缓存
-                if !new_balances.is_empty() {
-                    let mut cache = BALANCE_CACHE.write();
-                    for (k, v) in new_balances {
-                        cache.insert(k, v);
-                    }
-                }
-                if !new_txs.is_empty() {
-                    let mut cache = TX_CACHE.write();
-                    for (k, v) in new_txs {
-                        cache.insert(k, v);
-                    }
-                }
-
-                // 一次性更新 UI
-                version.set(version() + 1);
-                loading.set(false);
-                is_fetching.set(false);
-
-                if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                    save_wallet_cache(wid);
-                }
-            });
-        } else {
-            loading.set(false);
+            }
         }
     });
 
     // 排序：链顺序 → token顺序(Native,USDC,USDT) → 非0在前
     let all_chains_list = all_chains();
-    let chain_order: HashMap<u64, usize> = all_chains_list.iter()
+    let chain_order: HashMap<u64, usize> = all_chains_list
+        .iter()
         .enumerate()
         .map(|(i, c)| (c.chain_id, i))
         .collect();
@@ -1697,38 +1157,59 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
         (TokenType::Native, 0),
         (TokenType::USDC, 1),
         (TokenType::USDT, 2),
-    ].into_iter().collect();
+    ]
+    .into_iter()
+    .collect();
 
     let mut sorted = assets();
     sorted.sort_by(|a, b| {
         let chain_a = chain_order.get(&a.chain_id).copied().unwrap_or(99);
         let chain_b = chain_order.get(&b.chain_id).copied().unwrap_or(99);
-        if chain_a != chain_b { return chain_a.cmp(&chain_b); }
+        if chain_a != chain_b {
+            return chain_a.cmp(&chain_b);
+        }
         let tok_a = token_order.get(&a.token).copied().unwrap_or(99);
         let tok_b = token_order.get(&b.token).copied().unwrap_or(99);
-        if tok_a != tok_b { return tok_a.cmp(&tok_b); }
+        if tok_a != tok_b {
+            return tok_a.cmp(&tok_b);
+        }
         // 非0在前
         b.is_zero.cmp(&a.is_zero)
     });
 
     // 过滤：只显示有余额的资产（排除零余额、错误、加载中）
-    let filtered: Vec<&AssetItem> = sorted.iter()
-        .filter(|item| !item.is_zero && !item.balance_str.starts_with("错误") && item.balance_str != "加载中...")
+    let filtered: Vec<&AssetItem> = sorted
+        .iter()
+        .filter(|item| {
+            !item.is_zero
+                && !item.balance_str.starts_with("错误")
+                && item.balance_str != "加载中..."
+        })
         .collect();
 
     // 环图数据（仅非0且非错误）
     let ring_data: Vec<(usize, &AssetItem, f64)> = {
-        let non_zero: Vec<&AssetItem> = sorted.iter()
-            .filter(|item| !item.is_zero && !item.balance_str.starts_with("错误") && item.balance_str != "加载中...")
+        let non_zero: Vec<&AssetItem> = sorted
+            .iter()
+            .filter(|item| {
+                !item.is_zero
+                    && !item.balance_str.starts_with("错误")
+                    && item.balance_str != "加载中..."
+            })
             .collect();
-        let total: f64 = non_zero.iter()
+        let total: f64 = non_zero
+            .iter()
             .filter_map(|item| item.balance_str.parse::<f64>().ok())
             .sum();
         if total > 0.0 {
-            non_zero.iter()
+            non_zero
+                .iter()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    item.balance_str.parse::<f64>().ok().map(|val| (idx, *item, val / total))
+                    item.balance_str
+                        .parse::<f64>()
+                        .ok()
+                        .map(|val| (idx, *item, val / total))
                 })
                 .collect()
         } else {
@@ -1742,8 +1223,7 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
     let ring_inner = 55.0;
 
     // 弧段路径
-    fn arc_path(cx: f64, cy: f64, r: f64, inner: f64, start_angle: f64, end_angle: f64) -> String
-    {
+    fn arc_path(cx: f64, cy: f64, r: f64, inner: f64, start_angle: f64, end_angle: f64) -> String {
         let sweep = end_angle - start_angle;
         // 处理 360° 全圆（SVG 弧起止点相同会什么都不画）
         if sweep.abs() >= 2.0 * std::f64::consts::PI - 0.001 {
@@ -1755,8 +1235,14 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
         arc_path_half(cx, cy, r, inner, start_angle, end_angle)
     }
 
-    fn arc_path_half(cx: f64, cy: f64, r: f64, inner: f64, start_angle: f64, end_angle: f64) -> String
-    {
+    fn arc_path_half(
+        cx: f64,
+        cy: f64,
+        r: f64,
+        inner: f64,
+        start_angle: f64,
+        end_angle: f64,
+    ) -> String {
         let outer_x1 = cx + r * start_angle.cos();
         let outer_y1 = cy + r * start_angle.sin();
         let outer_x2 = cx + r * end_angle.cos();
@@ -1768,8 +1254,20 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
         let large = (end_angle - start_angle).abs() > std::f64::consts::PI;
         format!(
             "M {} {} A {} {} 0 {} 1 {} {} L {} {} A {} {} 0 {} 0 {} {} Z",
-            outer_x1, outer_y1, r, r, large as u8, outer_x2, outer_y2,
-            inner_x1, inner_y1, inner, inner, large as u8, inner_x2, inner_y2
+            outer_x1,
+            outer_y1,
+            r,
+            r,
+            large as u8,
+            outer_x2,
+            outer_y2,
+            inner_x1,
+            inner_y1,
+            inner,
+            inner,
+            large as u8,
+            inner_x2,
+            inner_y2
         )
     }
 
@@ -1781,7 +1279,7 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
     } else {
         let mut angle = -std::f64::consts::PI / 2.0;
         let mut paths = Vec::new();
-        for (idx, _item, ratio) in ring_data.iter() {
+        for (idx, item, ratio) in ring_data.iter() {
             let sweep = 2.0 * std::f64::consts::PI * ratio;
             let start_angle = angle;
             let end_angle = angle + sweep;
@@ -1790,9 +1288,26 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
 
             let path_d = path;
             let color_s = color.to_string();
+            let chain_id = item.chain_id;
+            let chain_name = item.chain_name.clone();
+            let token = item.token.clone();
+            let symbol = item.symbol.clone();
+            let mut p = page;
+            let mut stack = page_stack;
 
             paths.push(rsx! {
-                path { d: "{path_d}", fill: "{color_s}", opacity: "0.85", stroke: "#fff", stroke_width: "1" }
+                path {
+                    d: "{path_d}",
+                    fill: "{color_s}",
+                    opacity: "0.85",
+                    stroke: "#fff",
+                    stroke_width: "1",
+                    style: "cursor: pointer;",
+                    onclick: move |_| {
+                        stack.write().push(Page::WalletAssets);
+                        p.set(Page::AssetDetail { chain_id, chain_name: chain_name.clone(), token: token.clone(), symbol: symbol.clone(), enter_anim: true });
+                    },
+                }
             });
             angle += sweep;
         }
@@ -1825,17 +1340,10 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
                     button {
                         class: "btn btn-small btn-secondary",
                         onclick: move |_| {
-                            // 清除当前链所有代币的缓存（一次批量写入）
                             let chain = SELECTED_CHAIN.read().clone();
-                            {
-                                let mut cache = BALANCE_CACHE.write();
-                                cache.remove(&balance_key(chain.chain_id, &TokenType::Native));
-                                cache.remove(&balance_key(chain.chain_id, &TokenType::USDC));
-                                cache.remove(&balance_key(chain.chain_id, &TokenType::USDT));
-                            }
-                            TX_CACHE.write().remove(&chain.chain_id);
                             if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                                save_wallet_cache(wid);
+                                data::clear_chain_balances(wid, chain.chain_id);
+                                data::clear_chain_transactions(wid, chain.chain_id);
                             }
                             serial_trigger.set(serial_trigger() + 1);
                         },
@@ -1884,8 +1392,8 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
                             div {
                                 class: "asset-item",
                                 onclick: move |_| {
-                                    stack.write().push(p());
-                                    p.set(Page::AssetDetail { chain_id, chain_name: chain_name.clone(), token: token.clone(), symbol: symbol.clone() });
+                                    stack.write().push(Page::WalletAssets);
+                                    p.set(Page::AssetDetail { chain_id, chain_name: chain_name.clone(), token: token.clone(), symbol: symbol.clone(), enter_anim: true });
                                 },
                                 div { class: "asset-item-left",
                                     span { class: "asset-item-symbol", "{item.symbol} ({item.chain_name})" }
@@ -1902,11 +1410,122 @@ fn AssetsPage(address: String, refresh_counter: Signal<u32>, current_tab: Signal
     }
 }
 
+// ============ 登录面板（SendPage / SwapPage 共用）============
+
+#[component]
+fn LoginSheet(
+    visible: Signal<bool>,
+    leaving: Signal<bool>,
+    password: Signal<String>,
+    error: Signal<String>,
+    loading: Signal<bool>,
+) -> Element {
+    let wallet_list = load_wallet_list();
+    let current_wid = CURRENT_WALLET_ID.read().clone().unwrap_or_default();
+    let wallet_info = wallet_list.wallets.iter().find(|w| w.id == current_wid).cloned();
+    let sheet_name = wallet_info.as_ref().map(|w| w.name.clone()).unwrap_or_default();
+    let sheet_addr = wallet_info.as_ref().map(|w| shorten_address(&w.address)).unwrap_or_default();
+    let sheet_wid = current_wid;
+
+    rsx! {
+        if visible() {
+            div {
+                class: "login-overlay",
+                onclick: {
+                    move |_| {
+                        leaving.set(true);
+                        *PENDING_OP.write() = PendingOp::None;
+                    }
+                },
+                div {
+                    class: if leaving() { "card login-sheet leaving" } else { "card login-sheet" },
+                    onclick: move |e: Event<MouseData>| e.stop_propagation(),
+                    onanimationend: move |_: Event<AnimationData>| {
+                        if leaving() {
+                            visible.set(false);
+                            leaving.set(false);
+                        }
+                    },
+                    h1 { class: "title", "🔐 EC Wallet" }
+                    p { class: "subtitle", "签名: {sheet_name}" }
+                    if !sheet_addr.is_empty() {
+                        p { class: "subtitle", style: "margin-top: -16px; font-family: monospace; font-size: 12px; color: #999;", "{sheet_addr}" }
+                    }
+                    div { class: "form-group",
+                        label { "密码" }
+                        input {
+                            r#type: "password",
+                            placeholder: "请输入密码...",
+                            value: "{password}",
+                            oninput: move |e| password.set(e.value()),
+                            onkeypress: {
+                                let wid = sheet_wid.clone();
+                                move |e: Event<KeyboardData>| {
+                                    if e.key() == Key::Enter {
+                                        let pw = password().trim().to_string();
+                                        if pw.is_empty() {
+                                            error.set("请输入密码".into());
+                                            return;
+                                        }
+                                        loading.set(true);
+                                        error.set(String::new());
+                                        let keystore_path = get_wallet_keystore_path(&wid);
+                                        match crypto::keystore::load(pw, &keystore_path, false) {
+                                            Ok(sk_hex) => {
+                                                UNLOCKED_SK.write().replace(sk_hex);
+                                                leaving.set(true);
+                                            }
+                                            Err(e) => {
+                                                error.set(format!("解锁失败: {}", e));
+                                            }
+                                        }
+                                        loading.set(false);
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    if !error().is_empty() {
+                        p { class: "error", "{error}" }
+                    }
+                    button {
+                        class: "btn btn-primary",
+                        disabled: loading(),
+                        onclick: {
+                            let wid = sheet_wid.clone();
+                            move |_: Event<MouseData>| {
+                                let pw = password().trim().to_string();
+                                if pw.is_empty() {
+                                    error.set("请输入密码".into());
+                                    return;
+                                }
+                                loading.set(true);
+                                error.set(String::new());
+                                let keystore_path = get_wallet_keystore_path(&wid);
+                                match crypto::keystore::load(pw, &keystore_path, false) {
+                                    Ok(sk_hex) => {
+                                        UNLOCKED_SK.write().replace(sk_hex);
+                                        leaving.set(true);
+                                    }
+                                    Err(e) => {
+                                        error.set(format!("解锁失败: {}", e));
+                                    }
+                                }
+                                loading.set(false);
+                            }
+                        },
+                        if loading() { "解锁中..." } else { "🔓 解锁并签名" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ============ 发送页面 ============
 
 #[component]
-fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element {
     let address = get_current_wallet_address();
 
     let mut selected_token = use_signal(|| TokenType::Native);
@@ -1915,25 +1534,52 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     let mut error_msg = use_signal(|| String::new());
     let mut success_msg = use_signal(|| String::new());
     let mut sending = use_signal(|| false);
-    let mut gas_fee_percent = use_signal(|| 5u32); // 默认 5%
     let mut fetching_balance = use_signal(|| false);
     let mut max_amount_units: Signal<Option<u128>> = use_signal(|| None); // 存储精确的最小单位余额
 
+    let mut login_visible = use_signal(|| false);
+    let mut login_password = use_signal(|| String::new());
+    let mut login_error = use_signal(|| String::new());
+    let login_loading = use_signal(|| false);
+    let login_leaving = use_signal(|| false);
+
     let my_addr = address.clone();
     let my_addr_for_max = my_addr.clone(); // 用于 on_set_max
+
+    // 若有待执行的发送操作，恢复表单数据
+    use_effect(move || {
+        if let PendingOp::Send {
+            recipient: ref rec,
+            amount_str: ref amt,
+            token: ref tok,
+            ..
+        } = PENDING_OP.read().clone()
+        {
+            recipient.set(rec.clone());
+            amount_str.set(amt.clone());
+            selected_token.set(tok.clone());
+        }
+    });
 
     // 点击"全部"按钮的处理函数
     let on_set_max = move |_| {
         let token = selected_token();
         let addr = my_addr_for_max.clone();
         let chain = SELECTED_CHAIN.read().clone();
-        
+
         fetching_balance.set(true);
         error_msg.set(String::new());
-        
+
         spawn(async move {
             // 获取余额（返回最小单位）
-            let balance_units = match fetch_token_balance_units(&addr, &token, &chain).await {
+            let contract_address = token.contract_address(&chain);
+            let balance_units = match blockchain::read::fetch_balance_units(
+                &addr,
+                chain.rpc_url,
+                contract_address.as_deref(),
+            )
+            .await
+            {
                 Ok(units) => units,
                 Err(e) => {
                     error_msg.set(format!("获取余额失败: {}", e));
@@ -1941,21 +1587,22 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     return;
                 }
             };
-            
+
             if balance_units == 0 {
                 error_msg.set("余额为零".into());
                 fetching_balance.set(false);
                 return;
             }
-            
+
             // 存储精确的余额（最小单位）
             max_amount_units.set(Some(balance_units));
-            
+
             // 格式化为人类可读的字符串显示
             let decimals = token.decimals(&chain);
-            let display_str = format_units_to_decimal(balance_units, decimals, None);
+            let display_str =
+                blockchain::read::format_units_to_decimal(balance_units, decimals, None);
             amount_str.set(display_str);
-            
+
             fetching_balance.set(false);
         });
     };
@@ -1966,21 +1613,17 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let amount_input = amount_str().trim().to_string();
         let token = selected_token();
         let chain = SELECTED_CHAIN.read().clone();
-        let gas_percent = gas_fee_percent();
 
         // 基本验证
-        if to_addr.is_empty()
-        {
+        if to_addr.is_empty() {
             error_msg.set("请输入接收地址".into());
             return;
         }
-        if !blockchain::utils::is_valid_address(&to_addr)
-        {
+        if !blockchain::utils::is_valid_address(&to_addr) {
             error_msg.set("接收地址格式无效".into());
             return;
         }
-        if amount_input.is_empty()
-        {
+        if amount_input.is_empty() {
             error_msg.set("请输入金额".into());
             return;
         }
@@ -1993,13 +1636,19 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             match token {
                 TokenType::Native => match parse_token_amount_to_units(&amount_input, 18) {
                     Ok(v) => v,
-                    Err(e) => { error_msg.set(e); return; }
+                    Err(e) => {
+                        error_msg.set(e);
+                        return;
+                    }
                 },
                 TokenType::USDC | TokenType::USDT => {
                     let decimals = token.decimals(&chain);
                     match parse_token_amount_to_units(&amount_input, decimals) {
                         Ok(v) => v,
-                        Err(e) => { error_msg.set(e); return; }
+                        Err(e) => {
+                            error_msg.set(e);
+                            return;
+                        }
                     }
                 }
             }
@@ -2012,22 +1661,17 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 
         // 检查私钥
         if UNLOCKED_SK.read().is_none() {
-            // 暂存操作，跳到解锁页面
+            // 暂存操作，显示登录面板
             *PENDING_OP.write() = PendingOp::Send {
                 recipient: to_addr,
                 amount_units,
+                amount_str: amount_input,
                 token: token.clone(),
-                gas_percent,
                 chain,
             };
-            let mut stack = page_stack;
-            let mut p = page;
-            stack.write().push(p());
-            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                p.set(Page::Login(wid.clone()));
-            } else {
-                error_msg.set("未找到钱包".into());
-            }
+            login_password.set(String::new());
+            login_error.set(String::new());
+            login_visible.set(true);
             return;
         }
 
@@ -2037,11 +1681,25 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         sending.set(true);
         error_msg.set(String::new());
         success_msg.set(String::new());
+        let is_max = if let Some(max_units) = stored_max {
+            amount_units == max_units
+        } else {
+            false
+        };
 
         spawn(async move {
             let result = match token {
                 TokenType::Native => {
-                    send_native_transaction_units(&from_addr, &to_addr, amount_units, &sk_hex, &chain, gas_percent).await
+                    blockchain::transfer::send_native_transaction_units(
+                        &from_addr,
+                        &to_addr,
+                        amount_units,
+                        &sk_hex,
+                        chain.chain_id,
+                        chain.rpc_url,
+                        is_max,
+                    )
+                    .await
                 }
                 TokenType::USDC | TokenType::USDT => {
                     let contract_addr = match token.contract_address(&chain) {
@@ -2049,11 +1707,22 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                         None => {
                             error_msg.set(format!("该链不支持 {}", token.symbol(&chain)));
                             sending.set(false);
-                            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                            if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                                sk.zeroize();
+                            }
                             return;
                         }
                     };
-                    send_erc20_transaction(&from_addr, &to_addr, amount_units, &contract_addr, &sk_hex, &chain, gas_percent).await
+                    blockchain::transfer::send_erc20_transaction(
+                        &from_addr,
+                        &to_addr,
+                        amount_units,
+                        &contract_addr,
+                        &sk_hex,
+                        chain.chain_id,
+                        chain.rpc_url,
+                    )
+                    .await
                 }
             };
 
@@ -2062,13 +1731,16 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     success_msg.set(format!("交易已发送！交易哈希: {}", tx_hash));
                     amount_str.set(String::new());
                     max_amount_units.set(None);
+                    *PENDING_OP.write() = PendingOp::None;
                 }
                 Err(e) => {
                     error_msg.set(format!("发送失败: {}", e));
                 }
             }
             sending.set(false);
-            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+            if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                sk.zeroize();
+            }
         });
     };
 
@@ -2076,29 +1748,56 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     use_effect(move || {
         let op = PENDING_OP.read().clone();
         match op {
-            PendingOp::Send { recipient, amount_units, token, gas_percent, chain } => {
+            PendingOp::Send {
+                recipient,
+                amount_units,
+                token,
+                chain,
+                ..
+            } => {
                 if let Some(sk_hex) = UNLOCKED_SK.read().clone() {
-                    *PENDING_OP.write() = PendingOp::None;
                     let from_addr = address.clone();
                     sending.set(true);
                     error_msg.set(String::new());
                     success_msg.set(String::new());
+                    let is_max = max_amount_units.read().is_some();
                     spawn(async move {
                         let result = match token {
                             TokenType::Native => {
-                                send_native_transaction_units(&from_addr, &recipient, amount_units, &sk_hex, &chain, gas_percent).await
+                                blockchain::transfer::send_native_transaction_units(
+                                    &from_addr,
+                                    &recipient,
+                                    amount_units,
+                                    &sk_hex,
+                                    chain.chain_id,
+                                    chain.rpc_url,
+                                    is_max,
+                                )
+                                .await
                             }
                             TokenType::USDC | TokenType::USDT => {
                                 let contract_addr = match token.contract_address(&chain) {
                                     Some(addr) => addr,
                                     None => {
-                                        error_msg.set(format!("该链不支持 {}", token.symbol(&chain)));
+                                        error_msg
+                                            .set(format!("该链不支持 {}", token.symbol(&chain)));
                                         sending.set(false);
-                                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                                        if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                                            sk.zeroize();
+                                        }
                                         return;
                                     }
                                 };
-                                send_erc20_transaction(&from_addr, &recipient, amount_units, &contract_addr, &sk_hex, &chain, gas_percent).await
+                                blockchain::transfer::send_erc20_transaction(
+                                    &from_addr,
+                                    &recipient,
+                                    amount_units,
+                                    &contract_addr,
+                                    &sk_hex,
+                                    chain.chain_id,
+                                    chain.rpc_url,
+                                )
+                                .await
                             }
                         };
                         match result {
@@ -2106,13 +1805,16 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                                 success_msg.set(format!("交易已发送！交易哈希: {}", tx_hash));
                                 amount_str.set(String::new());
                                 max_amount_units.set(None);
+                                *PENDING_OP.write() = PendingOp::None;
                             }
                             Err(e) => {
                                 error_msg.set(format!("发送失败: {}", e));
                             }
                         }
                         sending.set(false);
-                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                        if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                            sk.zeroize();
+                        }
                     });
                 }
             }
@@ -2124,6 +1826,7 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
 
     let go_back = move || {
+        *PENDING_OP.write() = PendingOp::None;
         let mut stack = page_stack;
         let mut p = page;
         if let Some(prev) = stack.write().pop() {
@@ -2176,11 +1879,11 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                        onclick: move |_| go_back(),
-                    "← 返回"
+                    title: "返回",
+                    onclick: move |_| go_back(),
+                    "←"
                 }
                 span { class: "topbar-title", "📤 发送" }
-                span {}
             }
 
             div { class: "token-tabs",
@@ -2241,28 +1944,6 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     }
                 }
 
-                div { class: "form-group",
-                    label { "Gas Fee" }
-                    div { class: "gas-fee-buttons",
-                        button {
-                            class: if gas_fee_percent() == 2 { "gas-fee-btn active" } else { "gas-fee-btn" },
-                            onclick: move |_| gas_fee_percent.set(2),
-                            "2%"
-                        }
-                        button {
-                            class: if gas_fee_percent() == 5 { "gas-fee-btn active" } else { "gas-fee-btn" },
-                            onclick: move |_| gas_fee_percent.set(5),
-                            "5%"
-                        }
-                        button {
-                            class: if gas_fee_percent() == 8 { "gas-fee-btn active" } else { "gas-fee-btn" },
-                            onclick: move |_| gas_fee_percent.set(8),
-                            "8%"
-                        }
-                    }
-                    p { class: "gas-fee-hint", "基础 Gas Price 上浮相应百分比，提高交易确认速度" }
-                }
-
                 if !error_msg().is_empty() {
                     p { class: "error", "{error_msg}" }
                 }
@@ -2285,6 +1966,14 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     "⚠️ 请仔细核对接收地址和金额，交易一旦发送无法撤销。"
                 }
             }
+
+            LoginSheet {
+                visible: login_visible,
+                leaving: login_leaving,
+                password: login_password,
+                error: login_error,
+                loading: login_loading,
+            }
         }
     }
 }
@@ -2292,8 +1981,7 @@ fn SendPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 // ============ 接收页面 ============
 
 #[component]
-fn ReceivePage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn ReceivePage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element {
     let address = get_current_wallet_address();
 
     let mut copied = use_signal(|| false);
@@ -2347,11 +2035,11 @@ fn ReceivePage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                        onclick: move |_| go_back(),
-                    "← 返回"
+                    title: "返回",
+                    onclick: move |_| go_back(),
+                    "←"
                 }
                 span { class: "topbar-title", "📥 接收" }
-                span {}
             }
 
             div { class: "card",
@@ -2385,46 +2073,34 @@ fn ReceivePage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 
 /// 交换方向的代币类型（支持所有已知代币）
 #[derive(Debug, Clone, PartialEq)]
-enum SwapToken
-{
+enum SwapToken {
     Native,
     USDC,
     USDT,
 }
 
-impl SwapToken
-{
-    fn symbol(&self, chain: &ChainInfo) -> String
-    {
-        match self
-        {
+impl SwapToken {
+    fn symbol(&self, chain: &ChainInfo) -> String {
+        match self {
             SwapToken::Native => chain.native_symbol.to_string(),
             SwapToken::USDC => "USDC".to_string(),
             SwapToken::USDT => "USDT".to_string(),
         }
     }
 
-    fn decimals(&self, chain: &ChainInfo) -> u8
-    {
-        match self
-        {
+    fn decimals(&self, chain: &ChainInfo) -> u8 {
+        match self {
             SwapToken::Native => 18,
             SwapToken::USDC | SwapToken::USDT => {
                 // BNB Smart Chain (chain_id: 56) 上的 USDC 和 USDT 使用 18 位精度
-                if chain.chain_id == 56 {
-                    18
-                } else {
-                    6
-                }
+                if chain.chain_id == 56 { 18 } else { 6 }
             }
         }
     }
 
     /// 返回代币合约地址；原生代币返回 "native"
-    fn address(&self, chain: &ChainInfo) -> Option<String>
-    {
-        match self
-        {
+    fn address(&self, chain: &ChainInfo) -> Option<String> {
+        match self {
             SwapToken::Native => Some("native".to_string()),
             SwapToken::USDC => chain.usdc_address.map(|s| s.to_string()),
             SwapToken::USDT => chain.usdt_address.map(|s| s.to_string()),
@@ -2432,21 +2108,19 @@ impl SwapToken
     }
 
     /// 返回获取报价时使用的地址（原生代币用 WETH）
-    fn quote_address(&self, chain: &ChainInfo) -> Option<String>
-    {
-        match self
-        {
-            SwapToken::Native => blockchain::swap::weth_address(chain.chain_id).map(|s| s.to_string()),
+    fn quote_address(&self, chain: &ChainInfo) -> Option<String> {
+        match self {
+            SwapToken::Native => {
+                blockchain::swap::weth_address(chain.chain_id).map(|s| s.to_string())
+            }
             SwapToken::USDC => chain.usdc_address.map(|s| s.to_string()),
             SwapToken::USDT => chain.usdt_address.map(|s| s.to_string()),
         }
     }
 
     /// 转换为 TokenType（用于查询余额）
-    fn to_token_type(&self) -> TokenType
-    {
-        match self
-        {
+    fn to_token_type(&self) -> TokenType {
+        match self {
             SwapToken::Native => TokenType::Native,
             SwapToken::USDC => TokenType::USDC,
             SwapToken::USDT => TokenType::USDT,
@@ -2455,8 +2129,7 @@ impl SwapToken
 }
 
 #[component]
-fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element {
     let chain = SELECTED_CHAIN.read().clone();
     let chain_supported = blockchain::swap::is_chain_supported(chain.chain_id);
 
@@ -2476,7 +2149,24 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     let mut fetching_swap_balance = use_signal(|| false);
     let mut max_swap_amount_units: Signal<Option<u128>> = use_signal(|| None); // 存储精确的最小单位余额
 
+    let mut login_visible = use_signal(|| false);
+    let mut login_password = use_signal(|| String::new());
+    let mut login_error = use_signal(|| String::new());
+    let login_loading = use_signal(|| false);
+    let login_leaving = use_signal(|| false);
+
     let addr_for_max = address.clone();
+
+    // 若有待执行的交换操作，恢复表单数据
+    use_effect(move || {
+        if let PendingOp::Swap {
+            amount_str: ref amt,
+            ..
+        } = PENDING_OP.read().clone()
+        {
+            amount_str.set(amt.clone());
+        }
+    });
 
     // 点击"全部"按钮的处理函数（交换页面）
     let on_set_max_swap = move |_| {
@@ -2484,13 +2174,20 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let token_type = token.to_token_type();
         let addr = addr_for_max.clone();
         let chain = SELECTED_CHAIN.read().clone();
-        
+
         fetching_swap_balance.set(true);
         error_msg.set(String::new());
-        
+
         spawn(async move {
             // 获取余额（返回最小单位）
-            let balance_units = match fetch_token_balance_units(&addr, &token_type, &chain).await {
+            let contract_address = token_type.contract_address(&chain);
+            let balance_units = match blockchain::read::fetch_balance_units(
+                &addr,
+                chain.rpc_url,
+                contract_address.as_deref(),
+            )
+            .await
+            {
                 Ok(units) => units,
                 Err(e) => {
                     error_msg.set(format!("获取余额失败: {}", e));
@@ -2498,25 +2195,26 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                     return;
                 }
             };
-            
+
             if balance_units == 0 {
                 error_msg.set("余额为零".into());
                 fetching_swap_balance.set(false);
                 return;
             }
-            
+
             // 存储精确的余额（最小单位）
             max_swap_amount_units.set(Some(balance_units));
-            
+
             // 格式化为人类可读的字符串显示
             let decimals = token.decimals(&chain);
-            let display_str = format_units_to_decimal(balance_units, decimals, None);
+            let display_str =
+                blockchain::read::format_units_to_decimal(balance_units, decimals, None);
             amount_str.set(display_str);
-            
+
             // 清除之前的报价
             quote_result.set(String::new());
             quote_amount_out.set(None);
-            
+
             fetching_swap_balance.set(false);
         });
     };
@@ -2530,14 +2228,12 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let fee = fee_tier();
         let stored_max = max_swap_amount_units(); // 获取存储的精确最大金额
 
-        if from == to
-        {
+        if from == to {
             error_msg.set("输入和输出代币不能相同".into());
             return;
         }
 
-        if amount_input.is_empty()
-        {
+        if amount_input.is_empty() {
             error_msg.set("请输入金额".into());
             return;
         }
@@ -2579,21 +2275,17 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             return;
         }
 
-        let token_in_addr = match from.quote_address(&chain)
-        {
+        let token_in_addr = match from.quote_address(&chain) {
             Some(addr) => addr,
-            None =>
-            {
+            None => {
                 error_msg.set("该链不支持此输入代币".into());
                 return;
             }
         };
 
-        let token_out_addr = match to.quote_address(&chain)
-        {
+        let token_out_addr = match to.quote_address(&chain) {
             Some(addr) => addr,
-            None =>
-            {
+            None => {
                 error_msg.set("该链不支持此输出代币".into());
                 return;
             }
@@ -2611,17 +2303,22 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let to_symbol = to.symbol(&chain);
 
         spawn(async move {
-            let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-            match blockchain::swap::get_quote(&rpc, &token_in_addr, &token_out_addr, &amount_in_hex, fee).await
+            match blockchain::swap::get_quote_with_rpc_url(
+                chain.rpc_url,
+                &token_in_addr,
+                &token_out_addr,
+                &amount_in_hex,
+                fee,
+            )
+            .await
             {
-                Ok(quote) =>
-                {
-                    let formatted = blockchain::swap::format_token_amount(quote.amount_out, to_decimals);
+                Ok(quote) => {
+                    let formatted =
+                        blockchain::swap::format_token_amount(quote.amount_out, to_decimals);
                     quote_result.set(format!("≈ {} {}", formatted, to_symbol));
                     quote_amount_out.set(Some(quote.amount_out));
                 }
-                Err(e) =>
-                {
+                Err(e) => {
                     error_msg.set(format!("获取报价失败: {}", e));
                 }
             }
@@ -2638,29 +2335,25 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         let chain = SELECTED_CHAIN.read().clone();
         let fee = fee_tier();
 
-        if from == to
-        {
+        if from == to {
             error_msg.set("输入和输出代币不能相同".into());
             return;
         }
 
-        if amount_input.is_empty()
-        {
+        if amount_input.is_empty() {
             error_msg.set("请输入金额".into());
             return;
         }
 
         // 根据代币类型解析金额（与 on_get_quote 保持一致，纯整数）
         let amount_in: u128 = match from {
-            SwapToken::Native => {
-                match parse_token_amount_to_units(&amount_input, 18) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error_msg.set(e);
-                        return;
-                    }
+            SwapToken::Native => match parse_token_amount_to_units(&amount_input, 18) {
+                Ok(v) => v,
+                Err(e) => {
+                    error_msg.set(e);
+                    return;
                 }
-            }
+            },
             SwapToken::USDC | SwapToken::USDT => {
                 let decimals = from.decimals(&chain);
                 match parse_token_amount_to_units(&amount_input, decimals) {
@@ -2679,21 +2372,17 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         }
 
         // 解析滑点（存储为整数，表示百分比的 10 倍，例如 5 表示 0.5%）
-        let slippage_times_10: u32 = match slippage_str().trim().parse::<f32>()
-        {
+        let slippage_times_10: u32 = match slippage_str().trim().parse::<f32>() {
             Ok(v) if v > 0.0 && v < 50.0 => (v * 10.0) as u32,
-            _ =>
-            {
+            _ => {
                 error_msg.set("滑点必须在 0-50% 之间".into());
                 return;
             }
         };
 
-        let quoted_out = match quote_amount_out()
-        {
+        let quoted_out = match quote_amount_out() {
             Some(v) => v,
-            None =>
-            {
+            None => {
                 error_msg.set("请先获取报价".into());
                 return;
             }
@@ -2702,21 +2391,17 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         // 计算最小输出（考虑滑点）- 使用纯整数运算
         let amount_out_min = quoted_out * (1000 - slippage_times_10 as u128) / 1000;
 
-        let token_in_addr = match from.address(&chain)
-        {
+        let token_in_addr = match from.address(&chain) {
             Some(addr) => addr,
-            None =>
-            {
+            None => {
                 error_msg.set("该链不支持此输入代币".into());
                 return;
             }
         };
 
-        let token_out_addr = match to.address(&chain)
-        {
+        let token_out_addr = match to.address(&chain) {
             Some(addr) => addr,
-            None =>
-            {
+            None => {
                 error_msg.set("该链不支持此输出代币".into());
                 return;
             }
@@ -2728,20 +2413,16 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                 token_in_addr,
                 token_out_addr,
                 amount_in,
+                amount_str: amount_input,
                 amount_out_min,
                 fee,
                 recipient: address_for_swap.clone(),
                 chain_id: chain.chain_id,
                 rpc_url: chain.rpc_url.to_string(),
             };
-            let mut stack = page_stack;
-            let mut p = page;
-            stack.write().push(p());
-            if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                p.set(Page::Login(wid.clone()));
-            } else {
-                error_msg.set("未找到钱包".into());
-            }
+            login_password.set(String::new());
+            login_error.set(String::new());
+            login_visible.set(true);
             return;
         }
 
@@ -2763,23 +2444,28 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
         };
 
         spawn(async move {
-            let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-            match blockchain::swap::execute_swap(&rpc, &swap_params, &sk_hex).await
+            match blockchain::swap::execute_swap_with_rpc_url(
+                chain.rpc_url,
+                &swap_params,
+                &sk_hex,
+            )
+            .await
             {
-                Ok(tx_hash) =>
-                {
+                Ok(tx_hash) => {
                     success_msg.set(format!("交换成功！交易哈希: {}", tx_hash));
                     amount_str.set(String::new());
                     quote_result.set(String::new());
                     quote_amount_out.set(None);
+                    *PENDING_OP.write() = PendingOp::None;
                 }
-                Err(e) =>
-                {
+                Err(e) => {
                     error_msg.set(format!("交换失败: {}", e));
                 }
             }
             swapping.set(false);
-            if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+            if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                sk.zeroize();
+            }
         });
     };
 
@@ -2787,9 +2473,18 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     use_effect(move || {
         let op = PENDING_OP.read().clone();
         match op {
-            PendingOp::Swap { token_in_addr, token_out_addr, amount_in, amount_out_min, fee, recipient, chain_id, rpc_url } => {
+            PendingOp::Swap {
+                token_in_addr,
+                token_out_addr,
+                amount_in,
+                amount_out_min,
+                fee,
+                recipient,
+                chain_id,
+                rpc_url,
+                ..
+            } => {
                 if let Some(sk_hex) = UNLOCKED_SK.read().clone() {
-                    *PENDING_OP.write() = PendingOp::None;
                     swapping.set(true);
                     error_msg.set(String::new());
                     success_msg.set(String::new());
@@ -2803,23 +2498,28 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
                         chain_id,
                     };
                     spawn(async move {
-                        let rpc = blockchain::rpc::RpcClient::new(&rpc_url);
-                        match blockchain::swap::execute_swap(&rpc, &swap_params, &sk_hex).await
+                        match blockchain::swap::execute_swap_with_rpc_url(
+                            &rpc_url,
+                            &swap_params,
+                            &sk_hex,
+                        )
+                        .await
                         {
-                            Ok(tx_hash) =>
-                            {
+                            Ok(tx_hash) => {
                                 success_msg.set(format!("交换成功！交易哈希: {}", tx_hash));
                                 amount_str.set(String::new());
                                 quote_result.set(String::new());
                                 quote_amount_out.set(None);
+                                *PENDING_OP.write() = PendingOp::None;
                             }
-                            Err(e) =>
-                            {
+                            Err(e) => {
                                 error_msg.set(format!("交换失败: {}", e));
                             }
                         }
                         swapping.set(false);
-                        if let Some(mut sk) = UNLOCKED_SK.write().take() { sk.zeroize(); }
+                        if let Some(mut sk) = UNLOCKED_SK.write().take() {
+                            sk.zeroize();
+                        }
                     });
                 }
             }
@@ -2831,6 +2531,7 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
     let mut touch_start = use_signal(|| (0.0f64, 0.0f64));
 
     let go_back = move || {
+        *PENDING_OP.write() = PendingOp::None;
         let mut stack = page_stack;
         let mut p = page;
         if let Some(prev) = stack.write().pop() {
@@ -2881,11 +2582,11 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
-                        onclick: move |_| go_back(),
-                    "← 返回"
+                    title: "返回",
+                    onclick: move |_| go_back(),
+                    "←"
                 }
                 span { class: "topbar-title", "🔄 交换" }
-                span {}
             }
 
             if !chain_supported {
@@ -3080,6 +2781,14 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
             div { class: "notice", style: "margin-top: 12px;",
                 "⚠️ 交换通过 Uniswap V3 执行。请确认报价后再执行交换，交易一旦发送无法撤销。"
             }
+
+            LoginSheet {
+                visible: login_visible,
+                leaving: login_leaving,
+                password: login_password,
+                error: login_error,
+                loading: login_loading,
+            }
         }
     }
 }
@@ -3087,8 +2796,7 @@ fn SwapPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
 // ============ 钱包详情模态窗口 ============
 
 #[component]
-fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element
-{
+fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element {
     let created_time = format_timestamp(&wallet.created_at.to_string());
     let has_pubkey = !wallet.public_key_x.is_empty() && !wallet.public_key_y.is_empty();
 
@@ -3156,13 +2864,30 @@ fn WalletDetailModal(wallet: WalletInfo, on_close: EventHandler<()>) -> Element
 // ============ 交易记录组件 ============
 
 #[component]
-fn TxItem(tx: TxRecord, my_address: String, page: Signal<Page>, page_stack: Signal<Vec<Page>>) -> Element
-{
+fn TxItem(
+    tx: TxRecord,
+    my_address: String,
+    page: Signal<Page>,
+    page_stack: Signal<Vec<Page>>,
+) -> Element {
     let is_out = tx.from.to_lowercase() == my_address.to_lowercase();
     let dir = if is_out { "↑" } else { "↓" };
     let status = if tx.is_error { "❌" } else { "✅" };
-    let cp = if is_out { shorten_address(&tx.to) } else { shorten_address(&tx.from) };
-    let symbol = SELECTED_CHAIN.read().native_symbol.to_string();
+    let cp = if is_out {
+        shorten_address(&tx.to)
+    } else {
+        shorten_address(&tx.from)
+    };
+    let native_symbol = data::all_chains()
+        .iter()
+        .find(|c| c.chain_id == tx.chain_id)
+        .map(|c| c.native_symbol.to_string())
+        .unwrap_or_default();
+    let value_text = if tx.token_type == "Native" {
+        format!("{} {}", tx.value_display, native_symbol)
+    } else {
+        format!("{} {}", tx.token_amount, tx.token_symbol)
+    };
     let tx_for_detail = tx.clone();
 
     rsx! {
@@ -3179,7 +2904,7 @@ fn TxItem(tx: TxRecord, my_address: String, page: Signal<Page>, page_stack: Sign
                 span { class: "asset-tx-addr", "{cp}" }
             }
             div { class: "asset-tx-right",
-                span { class: "asset-tx-value", "{tx.value_eth} {symbol}" }
+                span { class: "asset-tx-value", "{value_text}" }
                 span { class: "asset-tx-status", "{status}" }
             }
             div { class: "asset-tx-time", "{tx.timestamp}" }
@@ -3190,8 +2915,15 @@ fn TxItem(tx: TxRecord, my_address: String, page: Signal<Page>, page_stack: Sign
 // ============ 资产详情页面 ============
 
 #[component]
-fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: u64, chain_name: String, token: TokenType, symbol: String) -> Element
-{
+fn AssetDetailPage(
+    page: Signal<Page>,
+    page_stack: Signal<Vec<Page>>,
+    chain_id: u64,
+    chain_name: String,
+    token: TokenType,
+    symbol: String,
+    enter_anim: bool,
+) -> Element {
     let mut balance_str = use_signal(|| "加载中...".to_string());
     let mut transactions: Signal<Vec<TxRecord>> = use_signal(Vec::new);
     let mut tx_loading = use_signal(|| false);
@@ -3229,20 +2961,9 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
                 let t = token.clone();
                 let c = chain.clone();
                 balance_str.set("加载中...".to_string());
-                spawn(async move {
-                    match fetch_token_balance_units(&addr, &t, &c).await {
-                        Ok(units) => {
-                            let decimals = t.decimals(&c);
-                            let formatted = format_units_to_decimal(units, decimals, None);
-                            BALANCE_CACHE.write().insert(cache_key, Ok(formatted.clone()));
-                            balance_str.set(formatted);
-                        }
-                        Err(e) => {
-                            BALANCE_CACHE.write().insert(cache_key, Err(e.clone()));
-                            balance_str.set(format!("错误: {}", e));
-                        }
-                    }
-                });
+                if let Some(wallet_id) = CURRENT_WALLET_ID.read().clone() {
+                    data::enqueue_balance(&wallet_id, &addr, c, t, RequestPriority::High);
+                }
             }
         });
     }
@@ -3250,38 +2971,39 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
     // 获取交易记录
     {
         let chain_id_copy = chain_id;
+        let token_copy = token.clone();
         use_effect(move || {
+            let _ = *TX_SERIAL.read();
             let _ = refresh_counter();
+            let chain_id = chain_id_copy;
+            let cache_key = tx_cache_key(chain_id, &token_copy);
+
+            if let Some(cached) = TX_CACHE.read().get(&cache_key) {
+                match cached {
+                    Ok(txs) => {
+                        tx_error.set(String::new());
+                        transactions.set(txs.clone());
+                        tx_loading.set(false);
+                    }
+                    Err(e) => {
+                        transactions.set(Vec::new());
+                        tx_error.set(format!("获取交易历史失败: {}", e));
+                        tx_loading.set(false);
+                    }
+                }
+                return;
+            }
+
             let chains = all_chains();
-            if let Some(chain) = chains.iter().find(|c| c.chain_id == chain_id_copy) {
+            if let Some(chain) = chains.iter().find(|c| c.chain_id == chain_id) {
                 let addr = get_current_wallet_address();
                 let c = chain.clone();
-
-                if let Some(cached) = TX_CACHE.read().get(&chain_id_copy) {
-                    match cached {
-                        Ok(txs) => { tx_error.set(String::new()); transactions.set(txs.clone()); tx_loading.set(false); }
-                        Err(e) => { transactions.set(Vec::new()); tx_error.set(format!("获取交易历史失败: {}", e)); tx_loading.set(false); }
-                    }
-                    return;
-                }
-
+                transactions.set(Vec::new());
                 tx_loading.set(true);
                 tx_error.set(String::new());
-                spawn(async move {
-                    match fetch_transactions(&addr, &c).await {
-                        Ok(txs) => {
-                            TX_CACHE.write().insert(chain_id_copy, Ok(txs.clone()));
-                            tx_error.set(String::new());
-                            transactions.set(txs);
-                        }
-                        Err(e) => {
-                            TX_CACHE.write().insert(chain_id_copy, Err(e.clone()));
-                            transactions.set(Vec::new());
-                            tx_error.set(format!("获取交易历史失败: {}", e));
-                        }
-                    }
-                    tx_loading.set(false);
-                });
+                if let Some(wallet_id) = CURRENT_WALLET_ID.read().clone() {
+                    data::enqueue_transactions(&wallet_id, &addr, c, RequestPriority::High);
+                }
             }
         });
     }
@@ -3316,21 +3038,22 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
     };
 
     let title = format!("{} ({})", symbol, chain_name);
+    let enter_anim_class = if enter_anim { "page-enter-right" } else { "" };
 
     rsx! {
         div {
-            class: "page page-enter-right {leave_anim}",
+            class: "page {enter_anim_class} {leave_anim}",
             ontouchstart: on_touch_start,
             ontouchend: on_touch_end,
             onanimationend: on_animation_end,
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
+                    title: "返回",
                     onclick: move |_| go_back(),
-                    "← 返回"
+                    "←"
                 }
                 span { class: "topbar-title", "{title}" }
-                span {}
             }
 
             div { class: "card", style: "text-align: center;",
@@ -3344,10 +3067,9 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
                     button {
                         class: "btn btn-small btn-secondary",
                         onclick: move |_| {
-                            BALANCE_CACHE.write().remove(&balance_key(chain_id, &token));
-                            TX_CACHE.write().remove(&chain_id);
                             if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
-                                save_wallet_cache(wid);
+                                data::clear_balance(wid, chain_id, &token);
+                                data::clear_transaction_group(wid, chain_id, &token);
                             }
                             refresh_counter.set(refresh_counter() + 1);
                         },
@@ -3373,6 +3095,11 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
                         let dir = if is_out { "↑" } else { "↓" };
                         let status = if tx_clone.is_error { "❌" } else { "✅" };
                         let cp = if is_out { shorten_address(&tx_clone.to) } else { shorten_address(&tx_clone.from) };
+                        let value_text = if tx_clone.token_type == "Native" {
+                            format!("{} {}", tx_clone.value_display, symbol)
+                        } else {
+                            format!("{} {}", tx_clone.token_amount, tx_clone.token_symbol)
+                        };
                         rsx! {
                             div {
                                 class: "asset-tx-item",
@@ -3383,6 +3110,7 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
                                     let push_page = Page::AssetDetail {
                                         chain_id, chain_name: chain_name.clone(),
                                         token: token.clone(), symbol: symbol.clone(),
+                                        enter_anim: false,
                                     };
                                     move |_| {
                                         stack.write().push(push_page.clone());
@@ -3394,7 +3122,7 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
                                     span { class: "asset-tx-addr", "{cp}" }
                                 }
                                 div { class: "asset-tx-right",
-                                    span { class: "asset-tx-value", "{tx_rec.value_eth} {symbol}" }
+                                    span { class: "asset-tx-value", "{value_text}" }
                                     span { class: "asset-tx-status", "{status}" }
                                 }
                                 div { class: "asset-tx-time", "{tx_rec.timestamp}" }
@@ -3410,12 +3138,27 @@ fn AssetDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, chain_id: 
 // ============ 交易详情页面 ============
 
 #[component]
-fn TransactionDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, tx: TxRecord) -> Element
-{
-    let chain = SELECTED_CHAIN.read().clone();
+fn TransactionDetailPage(
+    page: Signal<Page>,
+    page_stack: Signal<Vec<Page>>,
+    tx: TxRecord,
+) -> Element {
+    let chain_id = tx.chain_id;
+    let chain = data::all_chains()
+        .into_iter()
+        .find(|c| c.chain_id == chain_id)
+        .unwrap_or_else(data::default_chain);
     let explorer_tx_url = format!("{}/tx/{}", chain.explorer_url, tx.hash);
-    let status_text = if tx.is_error { "❌ 失败" } else { "✅ 成功" };
-    let direction_text = if tx.is_outgoing { "📤 发送" } else { "📥 接收" };
+    let (status_icon, status_text) = if tx.is_error {
+        ("❌", "失败")
+    } else {
+        ("✅", "成功")
+    };
+    let (direction_icon, direction_text) = if tx.is_outgoing {
+        ("↑", "发送")
+    } else {
+        ("↓", "接收")
+    };
     let explorer_url_clone = explorer_tx_url.clone();
 
     let mut leave_anim = use_signal(|| String::new());
@@ -3467,32 +3210,52 @@ fn TransactionDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, tx: 
             div { class: "topbar",
                 button {
                     class: "btn btn-small btn-secondary",
+                    title: "返回",
                     onclick: move |_| go_back(),
-                    "← 返回"
+                    "←"
                 }
                 span { class: "topbar-title", "📋 交易详情" }
-                span {}
             }
 
             div { class: "card",
                 div { class: "tx-detail-list",
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "状态" }
-                        span { class: "tx-detail-value", "{status_text}" }
+                        span { class: "tx-detail-value",
+                            span { class: "tx-detail-leading-symbol", "{status_icon}" }
+                            "{status_text}"
+                        }
                     }
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "类型" }
-                        span { class: "tx-detail-value", "{direction_text}" }
+                        span { class: "tx-detail-value",
+                            span { class: "tx-detail-leading-symbol", "{direction_icon}" }
+                            "{direction_text}"
+                        }
                     }
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "金额" }
-                        span { class: "tx-detail-value", "{tx.value_eth} {chain.native_symbol}" }
+                        span { class: "tx-detail-value",
+                            {
+                                if tx.token_type == "Native" {
+                                    format!("{} {}", tx.value_display, chain.native_symbol)
+                                } else {
+                                    format!("{} {}", tx.token_amount, tx.token_symbol)
+                                }
+                            }
+                        }
                     }
-                    div { class: "tx-detail-row",
-                        span { class: "tx-detail-label", "Wei" }
-                        span { class: "tx-detail-value tx-detail-mono", "{tx.value_wei}" }
+                    if tx.token_type == "Native" {
+                        div { class: "tx-detail-row",
+                            span { class: "tx-detail-label", "Wei" }
+                            span { class: "tx-detail-value tx-detail-mono", "{tx.value_wei}" }
+                        }
+                    } else {
+                        div { class: "tx-detail-row",
+                            span { class: "tx-detail-label", "合约地址" }
+                            span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.token_contract}" }
+                        }
                     }
-                    div { class: "tx-detail-divider" }
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "发送方" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.from}" }
@@ -3501,7 +3264,6 @@ fn TransactionDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, tx: 
                         span { class: "tx-detail-label", "接收方" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.to}" }
                     }
-                    div { class: "tx-detail-divider" }
                     div { class: "tx-detail-row",
                         span { class: "tx-detail-label", "交易哈希" }
                         span { class: "tx-detail-value tx-detail-mono tx-detail-address", "{tx.hash}" }
@@ -3535,74 +3297,31 @@ fn TransactionDetailPage(page: Signal<Page>, page_stack: Signal<Vec<Page>>, tx: 
 // ============ 全局状态 ============
 
 static UNLOCKED_SK: dioxus::prelude::GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
-static CURRENT_WALLET_ID: dioxus::prelude::GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
-static ETHERSCAN_KEY: dioxus::prelude::GlobalSignal<String> = GlobalSignal::new(|| load_api_key());
-static SELECTED_CHAIN: dioxus::prelude::GlobalSignal<ChainInfo> = GlobalSignal::new(|| default_chain());
-
-// 缓存：每条链每个代币的余额（首次获取后存入，后续直接展示缓存）
-static BALANCE_CACHE: dioxus::prelude::GlobalSignal<HashMap<String, Result<String, String>>> =
-    GlobalSignal::new(|| HashMap::new());
-// 缓存：每条链的交易记录（首次获取后存入，后续直接展示缓存）
-static TX_CACHE: dioxus::prelude::GlobalSignal<HashMap<u64, Result<Vec<TxRecord>, String>>> =
-    GlobalSignal::new(|| HashMap::new());
+static CURRENT_WALLET_ID: dioxus::prelude::GlobalSignal<Option<String>> =
+    GlobalSignal::new(|| None);
+static SELECTED_CHAIN: dioxus::prelude::GlobalSignal<ChainInfo> =
+    GlobalSignal::new(|| default_chain());
 
 /// 待执行的操作（签名后自动执行）
 static PENDING_OP: dioxus::prelude::GlobalSignal<PendingOp> = GlobalSignal::new(|| PendingOp::None);
-
-/// 正在执行中的余额查询 key（用于去重，防止重复 spawn）
-static IN_FLIGHT: dioxus::prelude::GlobalSignal<HashSet<String>> = GlobalSignal::new(|| HashSet::new());
-
-/// 持久化缓存结构（序列化到 files/cache/<wallet_id>.json）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WalletCache {
-    balances: HashMap<String, Result<String, String>>,
-    transactions: HashMap<u64, Result<Vec<TxRecord>, String>>,
-}
-
-/// 生成余额缓存 key: "chain_id_TokenType"，如 "1_Native"
-fn balance_key(chain_id: u64, token: &TokenType) -> String {
-    format!("{}_{:?}", chain_id, token)
-}
 
 // ============ 辅助函数 ============
 
 // ============ 钱包列表管理 ============
 
-/// 获取 Android 应用根目录 /data/data/<package>/
-fn get_app_dir() -> Option<std::path::PathBuf>
-{
-    let cmdline = std::fs::read("/proc/self/cmdline").ok()?;
-    let package_name = String::from_utf8_lossy(&cmdline)
-        .trim_matches(char::from(0))
-        .to_string();
-    if package_name.is_empty() {
-        return None;
-    }
-    let path = std::path::PathBuf::from(format!("/data/data/{}", package_name));
-    let _ = std::fs::create_dir_all(&path);
-    Some(path)
-}
-
 /// 获取数据根目录（Android files 目录）
-fn get_data_dir() -> Option<std::path::PathBuf>
-{
-    get_app_dir().map(|p| {
-        let files = p.join("files");
-        let _ = std::fs::create_dir_all(&files);
-        files
-    })
+fn get_data_dir() -> Option<std::path::PathBuf> {
+    data::app_files_dir()
 }
 
 /// 获取钱包 keystore 文件的完整路径: <exe_dir>/wallets/<id>
-fn get_wallet_keystore_path(wallet_id: &str) -> std::path::PathBuf
-{
+fn get_wallet_keystore_path(wallet_id: &str) -> std::path::PathBuf {
     let dir = get_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     dir.join(WALLETS_DIR).join(format!("{}", wallet_id))
 }
 
 /// 获取 wallet_list.json 的完整路径（放在 wallets 文件夹中）
-fn get_wallet_list_path() -> std::path::PathBuf
-{
+fn get_wallet_list_path() -> std::path::PathBuf {
     let dir = get_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let wallets_dir = dir.join(WALLETS_DIR);
     // 确保 wallets 目录存在
@@ -3610,58 +3329,12 @@ fn get_wallet_list_path() -> std::path::PathBuf
     wallets_dir.join(WALLET_LIST_FILE)
 }
 
-/// 获取缓存目录 files/cache/
-fn get_cache_dir() -> std::path::PathBuf
-{
-    let dir = get_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let cache_dir = dir.join("cache");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    cache_dir
-}
-
-/// 获取指定钱包的缓存文件路径
-fn get_cache_path(wallet_id: &str) -> std::path::PathBuf
-{
-    get_cache_dir().join(format!("{}.json", wallet_id))
-}
-
-/// 从文件加载钱包缓存
-fn load_wallet_cache(wallet_id: &str) -> Option<WalletCache>
-{
-    let path = get_cache_path(wallet_id);
+/// 读取钱包列表；文件不存在则返回空列表
+fn load_wallet_list() -> WalletList {
+    let path = get_wallet_list_path();
     if path.exists() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(cache) = serde_json::from_str(&data) {
-                return Some(cache);
-            }
-        }
-    }
-    None
-}
-
-/// 将当前内存缓存保存到文件
-fn save_wallet_cache(wallet_id: &str)
-{
-    let cache = WalletCache {
-        balances: BALANCE_CACHE.read().clone(),
-        transactions: TX_CACHE.read().clone(),
-    };
-    let path = get_cache_path(wallet_id);
-    if let Ok(json) = serde_json::to_string_pretty(&cache) {
-        let _ = std::fs::write(&path, json);
-    }
-}
-
-/// 读取钱包列表；文件不存在则返回空列表
-fn load_wallet_list() -> WalletList
-{
-    let path = get_wallet_list_path();
-    if path.exists()
-    {
-        if let Ok(data) = std::fs::read_to_string(&path)
-        {
-            if let Ok(list) = serde_json::from_str::<WalletList>(&data)
-            {
+            if let Ok(list) = serde_json::from_str::<WalletList>(&data) {
                 return list;
             }
         }
@@ -3673,73 +3346,50 @@ fn load_wallet_list() -> WalletList
 }
 
 /// 保存钱包列表到 wallet_list.json
-fn save_wallet_list(list: &WalletList)
-{
+fn save_wallet_list(list: &WalletList) {
     let path = get_wallet_list_path();
-    if let Ok(data) = serde_json::to_string_pretty(list)
-    {
+    if let Ok(data) = serde_json::to_string_pretty(list) {
         let _ = std::fs::write(path, data);
     }
 }
 
+fn delete_wallet(wallet_id: &str, list: &mut WalletList) {
+    let _ = std::fs::remove_file(get_wallet_keystore_path(wallet_id));
+    data::remove_wallet_cache(wallet_id);
+    list.wallets.retain(|wallet| wallet.id != wallet_id);
+    if list.default_wallet_id.as_deref() == Some(wallet_id) {
+        list.default_wallet_id = list.wallets.first().map(|wallet| wallet.id.clone());
+    }
+    save_wallet_list(list);
+}
+
 /// 生成唯一钱包 ID（基于公钥 x 坐标的前 8 字节）
-/// 
+///
 /// # 参数
 /// - `private_key_hex`: 私钥的十六进制字符串
-/// 
+///
 /// # 返回
 /// - 钱包 ID（16 位十六进制字符，即公钥 x 坐标的前 8 字节）
-fn generate_wallet_id(private_key_hex: &str) -> Result<String, String>
-{
+fn generate_wallet_id(private_key_hex: &str) -> Result<String, String> {
     // 获取公钥坐标
     let (x_hex, _y_hex) = blockchain::account::private_key_hex_to_public_key_xy(private_key_hex)?;
-    
+
     // 取 x 坐标的前 8 字节（16 个十六进制字符）
     let id = x_hex.chars().take(16).collect::<String>();
-    
+
     Ok(id)
 }
 
 /// 获取当前 Unix 时间戳（秒）
-fn current_unix_timestamp() -> u64
-{
+fn current_unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-fn load_api_key() -> String
-{
-    if let Some(dir) = get_app_dir()
-    {
-        let api_dir = dir.join("api");
-        if let Ok(key) = std::fs::read_to_string(api_dir.join(API_KEY_FILE))
-        {
-            let key = key.trim().to_string();
-            if !key.is_empty()
-            {
-                return key;
-            }
-        }
-    }
-    String::new()
-}
-
-fn save_api_key(key: &str)
-{
-    if let Some(dir) = get_app_dir()
-    {
-        let api_dir = dir.join("api");
-        // 确保 api 目录存在
-        let _ = std::fs::create_dir_all(&api_dir);
-        let _ = std::fs::write(api_dir.join(API_KEY_FILE), key.trim());
-    }
-}
-
 /// 获取当前钱包的地址（从钱包列表读取，不依赖私钥）
-fn get_current_wallet_address() -> String
-{
+fn get_current_wallet_address() -> String {
     if let Some(ref wid) = *CURRENT_WALLET_ID.read() {
         let list = load_wallet_list();
         if let Some(w) = list.wallets.iter().find(|w| w.id == *wid) {
@@ -3749,22 +3399,16 @@ fn get_current_wallet_address() -> String
     "未找到钱包".to_string()
 }
 
-fn shorten_address(addr: &str) -> String
-{
-    if addr.len() > 12
-    {
+fn shorten_address(addr: &str) -> String {
+    if addr.len() > 12 {
         format!("{}...{}", &addr[..6], &addr[addr.len() - 4..])
-    }
-    else
-    {
+    } else {
         addr.to_string()
     }
 }
 
-fn format_timestamp(unix_str: &str) -> String
-{
-    if let Ok(ts) = unix_str.parse::<i64>()
-    {
+fn format_timestamp(unix_str: &str) -> String {
+    if let Ok(ts) = unix_str.parse::<i64>() {
         // 转换为 UTC+8 时间（东八区）
         let utc8_offset = 8 * 3600; // 8小时的秒数
         let secs = ts + utc8_offset;
@@ -3774,44 +3418,37 @@ fn format_timestamp(unix_str: &str) -> String
         let minutes = (time_of_day % 3600) / 60;
 
         let (year, month, day) = days_to_ymd(days_since_epoch);
-        format!("{:04}-{:02}-{:02} {:02}:{:02} (UTC+8)", year, month, day, hours, minutes)
-    }
-    else
-    {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02} (UTC+8)",
+            year, month, day, hours, minutes
+        )
+    } else {
         unix_str.to_string()
     }
 }
 
-fn days_to_ymd(days: i64) -> (i64, i64, i64)
-{
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let mut y = 1970;
     let mut remaining = days;
 
-    loop
-    {
+    loop {
         let days_in_year = if is_leap_year(y) { 366 } else { 365 };
-        if remaining < days_in_year
-        {
+        if remaining < days_in_year {
             break;
         }
         remaining -= days_in_year;
         y += 1;
     }
 
-    let months_days = if is_leap_year(y)
-    {
+    let months_days = if is_leap_year(y) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    }
-    else
-    {
+    } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
 
     let mut m = 1;
-    for &md in &months_days
-    {
-        if remaining < md
-        {
+    for &md in &months_days {
+        if remaining < md {
             break;
         }
         remaining -= md;
@@ -3821,145 +3458,12 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64)
     (y, m, remaining + 1)
 }
 
-fn is_leap_year(y: i64) -> bool
-{
+fn is_leap_year(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn wei_decimal_to_eth(wei_str: &str) -> String
-{
-    if let Ok(wei) = wei_str.parse::<u128>()
-    {
-        let eth = blockchain::utils::wei_to_ether(wei);
-        if eth == 0.0
-        {
-            "0".to_string()
-        }
-        else if eth < 0.0001
-        {
-            format!("{:.6}", eth)
-        }
-        else
-        {
-            format!("{:.4}", eth)
-        }
-    }
-    else
-    {
-        "0".to_string()
-    }
-}
-
-// ============ 异步数据获取 ============
-
-async fn fetch_token_balance(address: &str, token: &TokenType, chain: &ChainInfo) -> Result<String, String>
-{
-    let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-
-    match token.contract_address(chain)
-    {
-        None =>
-        {
-            // 原生代币：直接查余额（返回 Wei）
-            let balance_hex = rpc.eth_get_balance(address, "latest").await?;
-            let balance_wei = blockchain::utils::hex_to_u128(&balance_hex)?;
-            
-            if balance_wei == 0
-            {
-                Ok("0".to_string())
-            }
-            else
-            {
-                // 格式化为人类可读的字符串（最多 8 位小数，截断不四舍五入）
-                let display_str = format_units_to_decimal(balance_wei, 18, None);
-                Ok(display_str)
-            }
-        }
-        Some(contract_addr) =>
-        {
-            // ERC20：通过合约查余额
-            let balance_hex = blockchain::contract::get_erc20_balance(&rpc, &contract_addr, address).await?;
-            let balance_u128 = blockchain::utils::hex_to_u128(&balance_hex)?;
-            let decimals = token.decimals(chain) as u32;
-            let divisor = 10u128.pow(decimals);
-            let whole = balance_u128 / divisor;
-            let frac = balance_u128 % divisor;
-            if balance_u128 == 0
-            {
-                Ok("0".to_string())
-            }
-            else
-            {
-                // 显示小数位数与代币精度匹配（USDC/USDT 为 6 位）
-                let frac_str = format!("{:0>width$}", frac, width = decimals as usize);
-                let trimmed = frac_str.trim_end_matches('0');
-                if trimmed.is_empty()
-                {
-                    Ok(format!("{}", whole))
-                }
-                else
-                {
-                    Ok(format!("{}.{}", whole, trimmed))
-                }
-            }
-        }
-    }
-}
-
-/// 获取代币余额（返回最小单位，u128）
-async fn fetch_token_balance_units(address: &str, token: &TokenType, chain: &ChainInfo) -> Result<u128, String>
-{
-    let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-
-    match token.contract_address(chain)
-    {
-        None =>
-        {
-            // 原生代币：直接查余额（返回 Wei）
-            let balance_hex = rpc.eth_get_balance(address, "latest").await?;
-            let balance_units = blockchain::utils::hex_to_u128(&balance_hex)?;
-            Ok(balance_units)
-        }
-        Some(contract_addr) =>
-        {
-            // ERC20：通过合约查余额（返回最小单位）
-            let balance_hex = blockchain::contract::get_erc20_balance(&rpc, &contract_addr, address).await?;
-            let balance_units = blockchain::utils::hex_to_u128(&balance_hex)?;
-            Ok(balance_units)
-        }
-    }
-}
-
-/// 将最小单位金额格式化为人类可读的十进制字符串
-/// max_decimals: 最多显示几位小数（直接截断不四舍五入），None 表示不限制
-fn format_units_to_decimal(units: u128, decimals: u8, max_decimals: Option<usize>) -> String
-{
-    let divisor = 10u128.pow(decimals as u32);
-    let whole = units / divisor;
-    let frac = units % divisor;
-    
-    if frac == 0 {
-        format!("{}", whole)
-    } else {
-        // 格式化小数部分，去除尾部的零
-        let frac_str = format!("{:0>width$}", frac, width = decimals as usize);
-        let mut trimmed: String = frac_str.trim_end_matches('0').to_string();
-        if let Some(max) = max_decimals {
-            if trimmed.len() > max {
-                trimmed.truncate(max);
-            }
-        }
-        if trimmed.is_empty() {
-            format!("{}", whole)
-        } else {
-            format!("{}.{}", whole, trimmed)
-        }
-    }
-}
-
 /// 将全精度余额字符串截断到 8 位小数（仅用于主页展示）
-fn truncate_balance_for_display(bal: &str) -> String
-{
+fn truncate_balance_for_display(bal: &str) -> String {
     if let Some(dot_pos) = bal.find('.') {
         let int_part = &bal[..dot_pos];
         let frac_part = &bal[dot_pos + 1..];
@@ -3970,45 +3474,12 @@ fn truncate_balance_for_display(bal: &str) -> String
     bal.to_string()
 }
 
-async fn fetch_transactions(address: &str, chain: &ChainInfo) -> Result<Vec<TxRecord>, String>
-{
-    let api_key = ETHERSCAN_KEY.read().clone();
-    if api_key.is_empty()
-    {
-        return Err("需要 Etherscan API Key 才能查看交易历史。请在下方设置中填入你的 API Key（可在 etherscan.io 免费注册获取）".to_string());
-    }
-
-    let client = blockchain::etherscan::EtherscanClient::new(chain.explorer_api_url, &api_key, chain.chain_id);
-    let txs = client.get_recent_transactions(address, 20).await?;
-
-    let my_addr = address.to_lowercase();
-    let records: Vec<TxRecord> = txs
-        .into_iter()
-        .map(|tx| {
-            let is_outgoing = tx.from.to_lowercase() == my_addr;
-            TxRecord {
-                hash: tx.hash,
-                from: tx.from,
-                to: tx.to,
-                value_eth: wei_decimal_to_eth(&tx.value),
-                value_wei: tx.value,
-                timestamp: format_timestamp(&tx.timestamp),
-                block_number: tx.block_number,
-                gas_used: tx.gas_used,
-                is_error: tx.is_error == "1",
-                is_outgoing,
-            }
-        })
-        .collect();
-    Ok(records)
-}
-
 /// 解析代币金额字符串为最小单位（纯整数，不经过浮点数）
-/// 
+///
 /// # 参数
 /// - `amount_str`: 金额字符串，如 "10.5" 或 "10"
 /// - `decimals`: 代币精度（小数位数），如 18 或 6
-/// 
+///
 /// # 返回
 /// - Ok(u128): 最小单位数量
 /// - Err(String): 错误信息
@@ -4023,128 +3494,34 @@ fn parse_token_amount_to_units(amount_str: &str, decimals: u8) -> Result<u128, S
         if parts.len() != 2 {
             return Err("金额格式无效".to_string());
         }
-        
+
         // 解析整数部分
-        let integer_part: u128 = parts[0].parse()
-            .map_err(|_| "金额格式无效".to_string())?;
-        
+        let integer_part: u128 = parts[0].parse().map_err(|_| "金额格式无效".to_string())?;
+
         // 处理小数部分
         let mut decimal_part = parts[1].to_string();
         if decimal_part.len() > decimals as usize {
             return Err(format!("最多支持 {} 位小数", decimals));
         }
-        
+
         // 补齐到指定精度
         while decimal_part.len() < decimals as usize {
             decimal_part.push('0');
         }
-        
-        let decimal_value: u128 = decimal_part.parse()
+
+        let decimal_value: u128 = decimal_part
+            .parse()
             .map_err(|_| "金额格式无效".to_string())?;
-        
+
         // 计算最小单位：整数部分 * 10^decimals + 小数部分
         let divisor = 10u128.pow(decimals as u32);
         Ok(integer_part * divisor + decimal_value)
     } else {
         // 没有小数点，直接解析整数部分
-        let integer_part: u128 = amount_str.parse()
-            .map_err(|_| "金额格式无效".to_string())?;
+        let integer_part: u128 = amount_str.parse().map_err(|_| "金额格式无效".to_string())?;
         let divisor = 10u128.pow(decimals as u32);
         Ok(integer_part * divisor)
     }
-}
-
-/// 发送原生代币交易（ETH、BNB、MATIC 等）- 使用最小单位
-async fn send_native_transaction_units(
-    from: &str,
-    to: &str,
-    amount_units: u128,
-    sk_hex: &str,
-    chain: &ChainInfo,
-    gas_fee_percent: u32,
-) -> Result<String, String>
-{
-    let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-    let chain_id = chain.chain_id;
-
-    // 1. 获取 nonce
-    let nonce = rpc.eth_get_transaction_count(from, "latest").await?;
-
-    // 2. 获取 gas price 并按百分比上浮
-    let gas_price_hex = rpc.eth_gas_price().await?;
-    let base_gas_price = blockchain::utils::hex_to_u128(&gas_price_hex)?;
-    let gas_price = base_gas_price + base_gas_price * gas_fee_percent as u128 / 100;
-
-    // 3. amount_units 已经是 Wei（最小单位）
-    let tx = blockchain::transaction::TransactionBuilder::new()
-        .tx_type(blockchain::transaction::TxType::Legacy)
-        .chain_id(chain_id)
-        .nonce(nonce)
-        .to(to)
-        .value_u128(amount_units)
-        .gas_limit(21000)
-        .gas_price_u128(gas_price)
-        .build()?;
-
-    let signed = blockchain::transaction::sign_transaction_with_hex(&tx, sk_hex)?;
-    let raw_hex = blockchain::transaction::serialize_signed_transaction(&signed);
-    let tx_hash = rpc.eth_send_raw_transaction(&raw_hex).await?;
-    Ok(tx_hash)
-}
-
-/// 发送 ERC20 代币交易（USDC、USDT 等）
-/// amount_units: 代币最小单位数量（USDC/USDT 为 10^6）
-async fn send_erc20_transaction(
-    from: &str,
-    to: &str,
-    amount_units: u128,
-    contract_address: &str,
-    sk_hex: &str,
-    chain: &ChainInfo,
-    gas_fee_percent: u32,
-) -> Result<String, String>
-{
-    let rpc = blockchain::rpc::RpcClient::new(chain.rpc_url);
-    let chain_id = chain.chain_id;
-
-    // 1. 获取 nonce
-    let nonce = rpc.eth_get_transaction_count(from, "latest").await?;
-
-    // 2. 获取 gas price 并按百分比上浮
-    let gas_price_hex = rpc.eth_gas_price().await?;
-    let base_gas_price = blockchain::utils::hex_to_u128(&gas_price_hex)?;
-    let gas_price = base_gas_price + base_gas_price * gas_fee_percent as u128 / 100;
-
-    // 3. 编码 ERC20 transfer 调用
-    let amount_hex = format!("0x{:x}", amount_units);
-    let data = blockchain::contract::encode_erc20_transfer(to, &amount_hex)?;
-    let data_hex = format!("0x{}", blockchain::utils::bytes_to_hex(&data));
-
-    // 4. 估算 gas
-    let estimate_tx = serde_json::json!({
-        "from": from,
-        "to": contract_address,
-        "data": data_hex
-    });
-    let gas_estimate = rpc.eth_estimate_gas(estimate_tx).await?;
-    // 加 20% 余量
-    let gas_limit = gas_estimate + gas_estimate / 5;
-
-    let tx = blockchain::transaction::TransactionBuilder::new()
-        .tx_type(blockchain::transaction::TxType::Legacy)
-        .chain_id(chain_id)
-        .nonce(nonce)
-        .to(contract_address)
-        .value_u128(0) // ERC20 转账 value 为 0
-        .data(data)
-        .gas_limit(gas_limit)
-        .gas_price_u128(gas_price)
-        .build()?;
-
-    let signed = blockchain::transaction::sign_transaction_with_hex(&tx, sk_hex)?;
-    let raw_hex = blockchain::transaction::serialize_signed_transaction(&signed);
-    let tx_hash = rpc.eth_send_raw_transaction(&raw_hex).await?;
-    Ok(tx_hash)
 }
 
 // ============ CSS 样式 ============
@@ -4182,13 +3559,55 @@ body {
     min-height: 100vh;
 }
 
-.login-page, .import-page {
+.import-page {
     display: flex;
     align-items: center;
     justify-content: center;
 }
 
+.login-overlay {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background: rgba(0, 0, 0, 0.65);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+.login-page {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    min-height: auto;
+    padding: 16px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+.login-sheet {
+    width: min(100%, 480px);
+    max-height: min(72vh, 560px);
+    margin-bottom: 0;
+    overflow-y: auto;
+    animation: login-sheet-up 0.28s ease-out;
+}
+
+.login-sheet.leaving {
+    animation: login-sheet-down 0.22s ease-in forwards;
+}
+
 .wallet-page {
+    padding-top: 16px;
     padding-bottom: 70px;
 }
 
@@ -4283,44 +3702,6 @@ body {
     color: #bbb;
 }
 
-.gas-fee-buttons {
-    display: flex;
-    gap: 10px;
-    margin-top: 8px;
-}
-
-.gas-fee-btn {
-    flex: 1;
-    padding: 10px 16px;
-    background: #ffffff;
-    border: 1px solid #ddd;
-    border-radius: 8px;
-    color: #999;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.gas-fee-btn:hover {
-    border-color: #667eea;
-    color: #333;
-}
-
-.gas-fee-btn.active {
-    background: linear-gradient(135deg, #667eea, #764ba2);
-    border-color: #667eea;
-    color: white;
-    box-shadow: 0 2px 10px rgba(102, 126, 234, 0.3);
-}
-
-.gas-fee-hint {
-    font-size: 12px;
-    color: #999;
-    margin-top: 8px;
-    line-height: 1.4;
-}
-
 .error {
     color: #ff6b6b;
     font-size: 13px;
@@ -4411,6 +3792,7 @@ body {
     align-items: center;
     margin-bottom: 16px;
     padding: 8px 0;
+    position: relative;
 }
 
 .topbar-title {
@@ -4419,6 +3801,15 @@ body {
     background: linear-gradient(135deg, #667eea, #764ba2);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.wallet-list-page .topbar-title,
+.wallet-page .topbar-title {
+    position: static;
+    transform: none;
 }
 
 .token-tabs {
@@ -4457,6 +3848,9 @@ body {
 
 .token-tab-icon {
     font-size: 16px;
+    display: inline-block;
+    min-width: 20px;
+    text-align: center;
 }
 
 .account-card {
@@ -4551,15 +3945,6 @@ body {
 
 /* ======== 发送页面 ======== */
 
-.send-page .topbar,
-.receive-page .topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 16px;
-    padding: 8px 0;
-}
-
 .success-box {
     background: rgba(107, 255, 107, 0.08);
     border: 1px solid rgba(107, 255, 107, 0.25);
@@ -4647,6 +4032,9 @@ body {
 
 .chain-selector-icon {
     font-size: 18px;
+    display: inline-block;
+    min-width: 24px;
+    text-align: center;
 }
 
 .chain-selector-name {
@@ -4831,7 +4219,7 @@ body {
     display: flex;
     flex-direction: column;
     padding: 10px 0;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+    border-bottom: 1px solid #ddd;
 }
 
 .tx-detail-row:last-child {
@@ -4853,6 +4241,13 @@ body {
     line-height: 1.4;
 }
 
+.tx-detail-leading-symbol {
+    display: inline-block;
+    width: 1.6em;
+    text-align: center;
+    color: #667eea;
+}
+
 .tx-detail-mono {
     font-family: "SF Mono", "Fira Code", monospace;
     font-size: 12px;
@@ -4863,18 +4258,12 @@ body {
     color: #555;
 }
 
-.tx-detail-divider {
-    height: 1px;
-    background: #e0e0e0;
-    margin: 4px 0;
-}
-
 /* ======== 钱包列表页面 ======== */
 
 .wallet-list-page {
     display: flex;
     flex-direction: column;
-    padding-top: 20px;
+    padding-top: 16px;
 }
 
 .wallet-list {
@@ -5243,6 +4632,28 @@ body {
 @keyframes slide-out-right {
     from { transform: translateX(0); }
     to   { transform: translateX(100%); }
+}
+
+@keyframes login-sheet-up {
+    from {
+        opacity: 0;
+        transform: translateY(100%);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes login-sheet-down {
+    from {
+        opacity: 1;
+        transform: translateY(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(100%);
+    }
 }
 
 @keyframes dropdown-expand {

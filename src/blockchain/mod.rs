@@ -18,9 +18,17 @@ pub mod contract;
 /// 提供通用的工具函数（单位转换、地址校验、十六进制处理等）
 pub mod utils;
 
-/// Etherscan API 模块
-/// 提供通过 Etherscan API 获取交易历史等功能
-pub mod etherscan;
+/// Blockscout v2 API 模块
+/// 提供通过 Blockscout API 获取交易历史、代币转移记录等功能
+pub mod blockscout;
+
+/// 钱包只读请求模块
+/// 提供余额和交易历史等纯网络请求，不依赖 UI 状态
+pub mod read;
+
+/// 转账请求模块
+/// 提供原生代币和 ERC20 发送请求，不依赖 UI 状态
+pub mod transfer;
 
 /// 类型转换模块
 /// 提供 k256 和 ark-secp256k1 之间的类型转换，确保跨 crate 接口不暴露 k256 类型

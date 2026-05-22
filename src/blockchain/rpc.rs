@@ -59,7 +59,10 @@ impl RpcClient
     {
         RpcClient {
             url: url.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(16))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             request_id: AtomicU64::new(1),
         }
     }

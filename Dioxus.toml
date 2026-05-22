@@ -4,4 +4,4 @@ android_manifest = "AndroidManifest.xml"
 
 [bundle]
 identifier = "com.ec.wallet"
-version = "2.0.0"
+version = "2.2.5"

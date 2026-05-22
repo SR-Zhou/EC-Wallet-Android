@@ -494,3 +494,29 @@ pub fn bool_to_bytes32(value: bool) -> [u8; 32]
     }
     result
 }
+
+/// 编码调用 OP GasPriceOracle.getL1Fee(bytes) 的 ABI 数据
+/// 
+/// 函数选择器: keccak256("getL1Fee(bytes)")[0..4] = 0xa44a11af
+/// 
+/// # 参数
+/// - `rlp_hex`: 已签名交易的 RLP 十六进制字符串（带 0x 前缀）
+/// 
+/// # 返回
+/// - ABI 编码后的完整调用数据（带 0x 前缀）
+pub fn encode_get_l1_fee_data(rlp_hex: &str) -> String {
+    let rlp_clean = remove_0x_prefix(rlp_hex);
+    let rlp_len = rlp_clean.len() / 2;
+
+    let mut data = String::from("0xa44a11af");
+    data.push_str(&format!("{:064x}", 32)); // offset to bytes data
+    data.push_str(&format!("{:064x}", rlp_len)); // bytes length
+    data.push_str(rlp_clean);
+
+    let remainder = rlp_clean.len() % 64;
+    if remainder != 0 {
+        data.push_str(&"0".repeat(64 - remainder));
+    }
+
+    data
+}

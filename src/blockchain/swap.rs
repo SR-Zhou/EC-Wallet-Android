@@ -4,7 +4,7 @@
 
 use super::contract;
 use super::rpc::RpcClient;
-use super::transaction::{self, TransactionBuilder, TxType};
+use super::transaction::{self, TransactionBuilder};
 use super::utils;
 use serde_json::json;
 
@@ -137,6 +137,18 @@ pub async fn get_quote(
     })
 }
 
+pub async fn get_quote_with_rpc_url(
+    rpc_url: &str,
+    token_in: &str,
+    token_out: &str,
+    amount_in: &str,
+    fee: u32,
+) -> Result<SwapQuote, String>
+{
+    let rpc = RpcClient::new(rpc_url);
+    get_quote(&rpc, token_in, token_out, amount_in, fee).await
+}
+
 // ============ 执行交换 ============
 
 /// 交换参数
@@ -209,8 +221,15 @@ pub async fn execute_swap(
 
     // 获取 gas price
     let gas_price_hex = rpc.eth_gas_price().await?;
-    let gas_price = utils::hex_to_u128(&gas_price_hex)?;
-    let gas_price = gas_price + gas_price / 10; // 加 10% 余量
+    let base_fee = utils::hex_to_u128(&gas_price_hex)?;
+
+    let max_priority_fee = rpc
+        .eth_max_priority_fee_per_gas()
+        .await
+        .ok()
+        .and_then(|h| utils::hex_to_u128(&h).ok())
+        .unwrap_or(1_000_000_000);
+    let max_fee_per_gas = base_fee + base_fee / 4 + max_priority_fee;
 
     // 估算 gas
     let data_hex = utils::add_0x_prefix(&utils::bytes_to_hex(&swap_data));
@@ -227,14 +246,14 @@ pub async fn execute_swap(
 
     // 构建交易
     let tx = TransactionBuilder::new()
-        .tx_type(TxType::Legacy)
         .chain_id(params.chain_id)
         .nonce(nonce)
         .to(SWAP_ROUTER_02)
         .value_u128(value)
         .data(swap_data)
         .gas_limit(gas_limit)
-        .gas_price_u128(gas_price)
+        .max_fee_per_gas_u128(max_fee_per_gas)
+        .max_priority_fee_per_gas_u128(max_priority_fee)
         .build()?;
 
     // 签名并发送
@@ -242,6 +261,16 @@ pub async fn execute_swap(
     let raw_hex = transaction::serialize_signed_transaction(&signed);
     let tx_hash = rpc.eth_send_raw_transaction(&raw_hex).await?;
     Ok(tx_hash)
+}
+
+pub async fn execute_swap_with_rpc_url(
+    rpc_url: &str,
+    params: &SwapParams,
+    sk_hex: &str,
+) -> Result<String, String>
+{
+    let rpc = RpcClient::new(rpc_url);
+    execute_swap(&rpc, params, sk_hex).await
 }
 
 // ============ 内部辅助函数 ============
@@ -411,8 +440,15 @@ async fn check_and_approve(
 
     let nonce = rpc.eth_get_transaction_count(owner, "latest").await?;
     let gas_price_hex = rpc.eth_gas_price().await?;
-    let gas_price = utils::hex_to_u128(&gas_price_hex)?;
-    let gas_price = gas_price + gas_price / 10;
+    let base_fee = utils::hex_to_u128(&gas_price_hex)?;
+
+    let max_priority_fee = rpc
+        .eth_max_priority_fee_per_gas()
+        .await
+        .ok()
+        .and_then(|h| utils::hex_to_u128(&h).ok())
+        .unwrap_or(1_000_000_000);
+    let max_fee_per_gas = base_fee + base_fee / 4 + max_priority_fee;
 
     // 估算 gas
     let estimate_tx = json!({
@@ -426,14 +462,14 @@ async fn check_and_approve(
     let approve_data = contract::encode_erc20_approve(spender, max_approve)?;
 
     let tx = TransactionBuilder::new()
-        .tx_type(TxType::Legacy)
         .chain_id(chain_id)
         .nonce(nonce)
         .to(token)
         .value_u128(0)
         .data(approve_data)
         .gas_limit(gas_limit)
-        .gas_price_u128(gas_price)
+        .max_fee_per_gas_u128(max_fee_per_gas)
+        .max_priority_fee_per_gas_u128(max_priority_fee)
         .build()?;
 
     let signed = transaction::sign_transaction_with_hex(&tx, sk_hex)?;

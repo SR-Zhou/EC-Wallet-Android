@@ -5,4 +5,5 @@ fn main()
 
 mod blockchain;
 mod crypto;
+mod data;
 mod gui;
