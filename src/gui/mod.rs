@@ -3791,7 +3791,11 @@ body {
     justify-content: space-between;
     align-items: center;
     margin-bottom: 16px;
-    padding: 8px 0;
+    padding:
+        calc(env(safe-area-inset-top) + 8px)
+        0
+        8px;
+    box-sizing: border-box;
     position: relative;
 }
 
